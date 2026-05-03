@@ -598,6 +598,18 @@ func TestEmitFlatPlaylist_JSON(t *testing.T) {
 	}
 }
 
+func TestShouldPrintPlaylistText(t *testing.T) {
+	if !shouldPrintPlaylistText(cli.Options{}) {
+		t.Fatalf("expected text output for default playlist mode")
+	}
+	if shouldPrintPlaylistText(cli.Options{PrintJSON: true}) {
+		t.Fatalf("expected text output suppression for print-json")
+	}
+	if shouldPrintPlaylistText(cli.Options{DumpSingleJSON: true}) {
+		t.Fatalf("expected text output suppression for dump-single-json")
+	}
+}
+
 func TestBuildDumpSingleJSONPayload_IncludesPlayableURL(t *testing.T) {
 	info := &client.VideoInfo{
 		ID:    "jNQXAC9IVRw",

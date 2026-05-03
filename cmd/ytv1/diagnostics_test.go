@@ -5,12 +5,37 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/famomatic/ytv1/client"
+	"github.com/famomatic/ytv1/internal/cli"
 )
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	os.Stdout = w
+	defer func() {
+		os.Stdout = oldStdout
+	}()
+
+	fn()
+
+	_ = w.Close()
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("io.Copy() error = %v", err)
+	}
+	return buf.String()
+}
 
 func TestRemediationHintsForAttempts_MissingPOT(t *testing.T) {
 	hints := remediationHintsForAttempts([]client.AttemptDetail{
@@ -54,28 +79,13 @@ func TestRemediationHintsForAttempts_403AndNoN(t *testing.T) {
 }
 
 func TestPrintGenericRemediationHints_NoPlayableSelectorDetail(t *testing.T) {
-	oldStdout := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() error = %v", err)
-	}
-	os.Stdout = w
-	defer func() {
-		os.Stdout = oldStdout
-	}()
-
-	printGenericRemediationHints(&client.NoPlayableFormatsDetailError{
-		Mode:           client.SelectionModeBest,
-		Selector:       "bestvideo+bestaudio",
-		SelectionError: "no formats matched selector",
+	out := captureStdout(t, func() {
+		printGenericRemediationHints(&client.NoPlayableFormatsDetailError{
+			Mode:           client.SelectionModeBest,
+			Selector:       "bestvideo+bestaudio",
+			SelectionError: "no formats matched selector",
+		})
 	})
-
-	_ = w.Close()
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
-		t.Fatalf("io.Copy() error = %v", err)
-	}
-	out := buf.String()
 	if !strings.Contains(out, "bestvideo+bestaudio") || !strings.Contains(out, "matched no formats") {
 		t.Fatalf("unexpected hint output: %q", out)
 	}
@@ -106,30 +116,16 @@ func TestClassifyExitCode(t *testing.T) {
 }
 
 func TestEmitJSONFailure(t *testing.T) {
-	oldStdout := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe() error = %v", err)
-	}
-	os.Stdout = w
-	defer func() {
-		os.Stdout = oldStdout
-	}()
-
-	emitJSONFailure("jNQXAC9IVRw", &client.NoPlayableFormatsDetailError{
-		Mode:           client.SelectionModeBest,
-		Selector:       "bestvideo+bestaudio",
-		SelectionError: "no formats matched selector",
-	}, exitCodeNoPlayableFormats)
-
-	_ = w.Close()
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
-		t.Fatalf("io.Copy() error = %v", err)
-	}
+	out := captureStdout(t, func() {
+		emitJSONFailure("jNQXAC9IVRw", &client.NoPlayableFormatsDetailError{
+			Mode:           client.SelectionModeBest,
+			Selector:       "bestvideo+bestaudio",
+			SelectionError: "no formats matched selector",
+		}, exitCodeNoPlayableFormats)
+	})
 	var payload map[string]any
-	if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
-		t.Fatalf("json.Unmarshal() error = %v, payload=%q", err, buf.String())
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v, payload=%q", err, out)
 	}
 	if ok, _ := payload["ok"].(bool); ok {
 		t.Fatalf("expected ok=false payload")
@@ -140,5 +136,40 @@ func TestEmitJSONFailure(t *testing.T) {
 	errMap, _ := payload["error"].(map[string]any)
 	if errMap["category"] != string(client.ErrorCategoryNoPlayableFormats) {
 		t.Fatalf("error.category=%v", errMap["category"])
+	}
+}
+
+func TestRun_PrintJSONStartupFailureForConfig(t *testing.T) {
+	prevWriter := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(io.Discard)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	}()
+
+	out := captureStdout(t, func() {
+		code := run(cli.Options{
+			URLs:        []string{"jNQXAC9IVRw"},
+			PrintJSON:   true,
+			CookiesFile: filepath.Join(t.TempDir(), "missing-cookies.txt"),
+		})
+		if code != exitCodeGenericFailure {
+			t.Fatalf("run() exit code=%d, want %d", code, exitCodeGenericFailure)
+		}
+	})
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v, payload=%q", err, out)
+	}
+	if ok, _ := payload["ok"].(bool); ok {
+		t.Fatalf("expected ok=false payload")
+	}
+	errMap, _ := payload["error"].(map[string]any)
+	msg, _ := errMap["message"].(string)
+	if !strings.Contains(msg, "failed to initialize config") {
+		t.Fatalf("unexpected startup error message: %q", msg)
 	}
 }

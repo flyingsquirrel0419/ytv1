@@ -39,24 +39,28 @@ const (
 
 func main() {
 	opts := cli.ParseFlags()
+	os.Exit(run(opts))
+}
 
+func run(opts cli.Options) int {
 	if len(opts.URLs) == 0 {
-		fmt.Println("Usage: ytv1 [OPTIONS] URL [URL...]")
-		// We don't exit 1 if help or version was requested, but ParseFlags handles Help auto-exit.
-		// If explicit Help flag wasn't handled by standard flag package (it usually is), we might descend here.
-		// Assuming standard flag behavior: Exit 0 on -h.
-		// If we are here, no URLs were provided.
-		os.Exit(1)
+		err := fmt.Errorf("%w: no input URLs provided", client.ErrInvalidInput)
+		if opts.PrintJSON {
+			emitJSONFailure("", err, exitCodeInvalidInput)
+		} else {
+			fmt.Println("Usage: ytv1 [OPTIONS] URL [URL...]")
+		}
+		return exitCodeInvalidInput
 	}
 
 	cfg, err := cli.ToClientConfig(opts)
 	if err != nil {
-		log.Fatalf("Failed to initialize config: %v", err)
+		return handleStartupError(opts, fmt.Errorf("failed to initialize config: %w", err))
 	}
 	if strings.TrimSpace(opts.DownloadArchive) != "" {
 		archive, err := newDownloadArchive(opts.DownloadArchive)
 		if err != nil {
-			log.Fatalf("Failed to initialize download archive: %v", err)
+			return handleStartupError(opts, fmt.Errorf("failed to initialize download archive: %w", err))
 		}
 		activeDownloadArchive = archive
 		defer func() {
@@ -68,10 +72,17 @@ func main() {
 	attachLifecycleHandlers(&cfg, opts)
 	c := client.New(cfg)
 	ctx := context.Background()
-	exitCode := processInputsWithExitCode(ctx, c, opts.URLs, opts, processURL)
-	if exitCode != exitCodeSuccess {
-		os.Exit(exitCode)
+	return processInputsWithExitCode(ctx, c, opts.URLs, opts, processURL)
+}
+
+func handleStartupError(opts cli.Options, err error) int {
+	code := classifyExitCode(err)
+	if opts.PrintJSON {
+		emitJSONFailure("", err, code)
+	} else {
+		log.Printf("Error: %v", err)
 	}
+	return code
 }
 
 func processInputs(
@@ -269,31 +280,43 @@ func buildDownloadOptions(opts cli.Options) client.DownloadOptions {
 }
 
 func processPlaylist(ctx context.Context, c *client.Client, playlistID string, opts cli.Options) error {
-	fmt.Printf("Fetching playlist: %s\n", playlistID)
+	if shouldPrintPlaylistText(opts) {
+		fmt.Printf("Fetching playlist: %s\n", playlistID)
+	}
 	playlist, err := c.GetPlaylist(ctx, playlistID)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Playlist: %s (%d videos)\n", playlist.Title, len(playlist.Items))
+	if shouldPrintPlaylistText(opts) {
+		fmt.Printf("Playlist: %s (%d videos)\n", playlist.Title, len(playlist.Items))
+	}
 	if opts.FlatPlaylist {
 		return emitFlatPlaylist(playlist.Items, opts, os.Stdout)
 	}
 
 	summary, failures := runPlaylistItems(ctx, c, playlist.Items, opts, processURL)
-	fmt.Printf(
-		"Playlist summary: total=%d succeeded=%d failed=%d aborted=%t\n",
-		summary.Total,
-		summary.Succeeded,
-		summary.Failed,
-		summary.Aborted,
-	)
+	if shouldPrintPlaylistText(opts) {
+		fmt.Printf(
+			"Playlist summary: total=%d succeeded=%d failed=%d aborted=%t\n",
+			summary.Total,
+			summary.Succeeded,
+			summary.Failed,
+			summary.Aborted,
+		)
+	}
 	if len(failures) > 0 {
-		for _, failure := range failures {
-			log.Printf("Failed to process %s: %v", failure.VideoID, failure.Err)
+		if shouldPrintPlaylistText(opts) {
+			for _, failure := range failures {
+				log.Printf("Failed to process %s: %v", failure.VideoID, failure.Err)
+			}
 		}
 		return fmt.Errorf("playlist completed with failures: failed=%d/%d", summary.Failed, summary.Total)
 	}
 	return nil
+}
+
+func shouldPrintPlaylistText(opts cli.Options) bool {
+	return !opts.PrintJSON && !opts.DumpSingleJSON
 }
 
 func emitFlatPlaylist(items []client.PlaylistItem, opts cli.Options, w io.Writer) error {

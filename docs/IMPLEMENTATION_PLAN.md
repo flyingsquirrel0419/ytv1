@@ -69,6 +69,7 @@
 - B10 compatibility follow-up landed: added `--dump-single-json` mode with yt-dlp-style single-entry payload (`url`, `webpage_url`, `formats`) for tool compatibility (including mpv ytdl hook expectations).
 - B10 compatibility follow-up landed: `--print-json` (`-J`, `-j`, `--dump-json`) now emits yt-dlp-style single-entry payload for external tool compatibility, while retaining shared JSON failure payload contract.
 - B11 completion increment landed: `-F` format list now emits explicit `Note` labels (`audio only`/`video only`/`av`) so operators can pick direct audio formats without relying on `0x0` inference.
+- B12 completion increment landed: playlist flows now suppress human stdout in JSON modes, alias reconciliation honors argument order for conflicting flags, and startup/config failures emit structured JSON diagnostics under `--print-json`.
 
 ### 1.4 Immediate Next Tasks (Strict Order)
 1. `[x]` B0. Rebaseline and target-definition reset for Cycle B
@@ -83,6 +84,7 @@
 10. `[x]` B9. Cycle B closeout and release checklist
 11. `[x]` B10. Post-closeout yt-dlp CLI compatibility aliases (`--flat-playlist` and related common flags)
 12. `[x]` B11. Format list UX parity (`-F` note column with explicit audio/video-only labels)
+13. `[x]` B12. Post-closeout CLI contract fixes (playlist JSON, alias precedence, startup JSON diagnostics)
 
 ---
 
@@ -263,6 +265,21 @@ Make `ytv1` a practical **YouTube-focused** CLI substitute for yt-dlp in daily o
 - Acceptance:
   - Added aliases parse deterministically and `go test ./...` remains green.
 
+### B12. Post-closeout CLI Contract Fixes
+- Status: `[x]`
+- Goal: Repair automation-facing CLI regressions without changing package-first boundaries.
+- Work:
+  1. Keep playlist stdout machine-readable in JSON modes.
+  2. Make alias parsing honor argument order / last-flag-wins semantics.
+  3. Route startup/configuration failures through the structured JSON diagnostics contract when `--print-json` is active.
+- Target files:
+  - `cmd/ytv1/main.go`
+  - `cmd/ytv1/*_test.go`
+  - `internal/cli/parser.go`
+  - `internal/cli/parser_test.go`
+- Acceptance:
+  - JSON modes emit JSON-only stdout, alias precedence is deterministic by argument order, and startup failures are covered by tests.
+
 ---
 
 ## 4. Public API Contract
@@ -309,6 +326,7 @@ Cycle B is complete only when all are true:
 - `2026-02-16`: B10 compatibility follow-up: added subtitle write alias support (`--write-srt`, `-write-srt`) mapped to `WriteSubs` and forced `SubFormat=srt`, with parser regression coverage.
 - `2026-02-16`: B10 compatibility follow-up: added `--dump-single-json` parser/emit path and yt-dlp-style payload serialization with CLI regression tests to improve external tool interoperability.
 - `2026-02-16`: B10 compatibility follow-up: aligned `--print-json` output path with `--dump-single-json` yt-dlp-style payload emission so callers that pass only `-J/--print-json` (e.g. mpv ytdl-hook variants) receive a playable `url` field.
+- `2026-05-04`: Completed `B12` by removing human playlist stdout from JSON modes, enforcing last-flag-wins alias resolution for conflicting CLI flags, and routing startup/configuration failures through the structured JSON diagnostics path; verified with `go test ./...`.
 
 ---
 

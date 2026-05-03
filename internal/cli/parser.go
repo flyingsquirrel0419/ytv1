@@ -8,6 +8,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,7 @@ type Options struct {
 // ParseFlags parses command-line arguments into Options.
 func ParseFlags() Options {
 	opts := Options{}
+	rawArgs := append([]string(nil), os.Args[1:]...)
 
 	// Helper to bind multiple flags to one variable
 	var formatShort, formatLong string
@@ -144,15 +146,40 @@ func ParseFlags() Options {
 
 	// Consolidate aliases
 	opts.FormatSelector = pickValue(formatShort, formatLong, "best")
+	if v, ok := findLastStringFlag(rawArgs, "-f", "--format"); ok {
+		opts.FormatSelector = v
+	}
 	opts.OutputTemplate = pickValue(outputShort, outputLong, "")
+	if v, ok := findLastStringFlag(rawArgs, "-o", "--output"); ok {
+		opts.OutputTemplate = v
+	}
 	opts.ListFormats = listFormatsShort || listFormatsLong
-	if !continueDownloads {
+	if v, ok := findLastBoolFlag(rawArgs, map[string]bool{
+		"--no-continue": true,
+		"--continue":    false,
+	}); ok {
+		opts.NoContinue = v
+	} else if !continueDownloads {
 		opts.NoContinue = true
 	}
-	if opts.IgnoreErrors {
+	if v, ok := findLastBoolFlag(rawArgs, map[string]bool{
+		"--abort-on-error":   true,
+		"--no-ignore-errors": true,
+		"--ignore-errors":    false,
+		"-i":                 false,
+	}); ok {
+		opts.AbortOnError = v
+		opts.IgnoreErrors = !v
+	} else if opts.IgnoreErrors {
 		opts.AbortOnError = false
 	}
-	if opts.YesPlaylist {
+	if v, ok := findLastBoolFlag(rawArgs, map[string]bool{
+		"--no-playlist":  true,
+		"--yes-playlist": false,
+	}); ok {
+		opts.NoPlaylist = v
+		opts.YesPlaylist = !v
+	} else if opts.YesPlaylist {
 		opts.NoPlaylist = false
 	}
 	if writeSRT {
@@ -172,6 +199,63 @@ func pickValue(v1, v2, def string) string {
 		return v2
 	}
 	return def
+}
+
+func findLastStringFlag(args []string, names ...string) (string, bool) {
+	var (
+		last  string
+		found bool
+	)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		for _, name := range names {
+			if arg == name {
+				if i+1 < len(args) {
+					last = args[i+1]
+					found = true
+				}
+				break
+			}
+			prefix := name + "="
+			if strings.HasPrefix(arg, prefix) {
+				last = strings.TrimPrefix(arg, prefix)
+				found = true
+				break
+			}
+		}
+	}
+	return last, found
+}
+
+func findLastBoolFlag(args []string, values map[string]bool) (bool, bool) {
+	var (
+		last  bool
+		found bool
+	)
+	for _, arg := range args {
+		for name, fallback := range values {
+			if arg == name {
+				last = fallback
+				found = true
+				break
+			}
+			prefix := name + "="
+			if strings.HasPrefix(arg, prefix) {
+				parsed, err := strconv.ParseBool(strings.TrimPrefix(arg, prefix))
+				if err != nil {
+					break
+				}
+				if fallback {
+					last = parsed
+				} else {
+					last = !parsed
+				}
+				found = true
+				break
+			}
+		}
+	}
+	return last, found
 }
 
 // ToClientConfig converts Options to client.Config.

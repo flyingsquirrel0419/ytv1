@@ -219,3 +219,54 @@ func TestParseFlags_DumpSingleJSON(t *testing.T) {
 		t.Fatalf("URLs=%v, want [jNQXAC9IVRw]", opts.URLs)
 	}
 }
+
+func TestParseFlags_LastAliasWinsForFormatAndOutput(t *testing.T) {
+	origArgs := os.Args
+	origFlagSet := flag.CommandLine
+	defer func() {
+		os.Args = origArgs
+		flag.CommandLine = origFlagSet
+	}()
+
+	os.Args = []string{"ytv1", "-f", "bestaudio", "--format", "bestvideo", "-o", "first.%(ext)s", "--output", "second.%(ext)s", "jNQXAC9IVRw"}
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	flag.CommandLine.SetOutput(io.Discard)
+
+	opts := ParseFlags()
+	if opts.FormatSelector != "bestvideo" {
+		t.Fatalf("FormatSelector=%q, want bestvideo", opts.FormatSelector)
+	}
+	if opts.OutputTemplate != "second.%(ext)s" {
+		t.Fatalf("OutputTemplate=%q, want second.%%(ext)s", opts.OutputTemplate)
+	}
+}
+
+func TestParseFlags_LastBooleanAliasWins(t *testing.T) {
+	origArgs := os.Args
+	origFlagSet := flag.CommandLine
+	defer func() {
+		os.Args = origArgs
+		flag.CommandLine = origFlagSet
+	}()
+
+	os.Args = []string{"ytv1", "--continue", "--no-continue", "--ignore-errors", "--abort-on-error", "--yes-playlist", "--no-playlist", "jNQXAC9IVRw"}
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	flag.CommandLine.SetOutput(io.Discard)
+
+	opts := ParseFlags()
+	if !opts.NoContinue {
+		t.Fatalf("NoContinue=%v, want true because later --no-continue should win", opts.NoContinue)
+	}
+	if !opts.AbortOnError {
+		t.Fatalf("AbortOnError=%v, want true because later --abort-on-error should win", opts.AbortOnError)
+	}
+	if opts.IgnoreErrors {
+		t.Fatalf("IgnoreErrors=%v, want false because later --abort-on-error should win", opts.IgnoreErrors)
+	}
+	if !opts.NoPlaylist {
+		t.Fatalf("NoPlaylist=%v, want true because later --no-playlist should win", opts.NoPlaylist)
+	}
+	if opts.YesPlaylist {
+		t.Fatalf("YesPlaylist=%v, want false because later --no-playlist should win", opts.YesPlaylist)
+	}
+}
