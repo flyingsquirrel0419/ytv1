@@ -111,7 +111,7 @@ func (c *Client) Download(ctx context.Context, input string, options DownloadOpt
 			case SelectionModeVideoOnly:
 				selStr = "bestvideo"
 			case SelectionModeAudioOnly, SelectionModeMP3:
-				selStr = "bestaudio"
+				selStr = "bestaudio/best"
 			default:
 				selStr = "best"
 			}

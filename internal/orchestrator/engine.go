@@ -3,11 +3,13 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	neturl "net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -272,8 +274,42 @@ func (e *Engine) applyPoToken(ctx context.Context, req *innertube.PlayerRequest,
 		}
 		return nil
 	}
-	req.SetPoToken(token)
+	cleanToken, err := cleanPoToken(token)
+	if err != nil {
+		if len(requiredProtocols) > 0 {
+			return &PoTokenRequiredError{
+				Client:            profile.Name,
+				Cause:             "invalid token from provider: " + err.Error(),
+				Policy:            innertube.PoTokenFetchPolicyRequired,
+				Protocols:         append([]innertube.VideoStreamingProtocol(nil), requiredProtocols...),
+				ProviderAvailable: true,
+			}
+		}
+		return nil
+	}
+	req.SetPoToken(cleanToken)
 	return nil
+}
+
+var poTokenCleanPattern = regexp.MustCompile(`^[^?&#]+`)
+
+func cleanPoToken(token string) (string, error) {
+	unescaped, err := neturl.QueryUnescape(strings.TrimSpace(token))
+	if err != nil {
+		return "", err
+	}
+	match := poTokenCleanPattern.FindString(unescaped)
+	if strings.TrimSpace(match) == "" {
+		return "", errors.New("empty token")
+	}
+	decoded, err := base64.URLEncoding.DecodeString(match)
+	if err != nil {
+		decoded, err = base64.RawURLEncoding.DecodeString(match)
+	}
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(decoded), nil
 }
 
 func requiresPoToken(profile innertube.ClientProfile, protocol innertube.VideoStreamingProtocol) bool {

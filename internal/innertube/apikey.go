@@ -336,6 +336,8 @@ func watchPageURLForProfile(profile ClientProfile, videoID string) string {
 			return "https://www.youtube.com/embed/"
 		}
 		return "https://www.youtube.com/embed/" + videoID + "?html5=1"
+	case id == "web_creator":
+		return "https://studio.youtube.com"
 	case strings.HasPrefix(id, "tv"):
 		return "https://www.youtube.com/tv"
 	default:

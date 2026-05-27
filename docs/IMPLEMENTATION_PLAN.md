@@ -70,6 +70,7 @@
 - B10 compatibility follow-up landed: `--print-json` (`-J`, `-j`, `--dump-json`) now emits yt-dlp-style single-entry payload for external tool compatibility, while retaining shared JSON failure payload contract.
 - B11 completion increment landed: `-F` format list now emits explicit `Note` labels (`audio only`/`video only`/`av`) so operators can pick direct audio formats without relying on `0x0` inference.
 - B12 completion increment landed: playlist flows now suppress human stdout in JSON modes, alias reconciliation honors argument order for conflicting flags, and startup/config failures emit structured JSON diagnostics under `--print-json`.
+- B13 upstream drift response landed: ported latest yt-dlp YouTube client policy changes affecting audio-only extraction (`android_vr -> web_safari` defaults, `web_creator` fallback profile, embedded client request shaping, PO token sanitization) and added an audio-only live regression gate.
 
 ### 1.4 Immediate Next Tasks (Strict Order)
 1. `[x]` B0. Rebaseline and target-definition reset for Cycle B
@@ -85,6 +86,7 @@
 11. `[x]` B10. Post-closeout yt-dlp CLI compatibility aliases (`--flat-playlist` and related common flags)
 12. `[x]` B11. Format list UX parity (`-F` note column with explicit audio/video-only labels)
 13. `[x]` B12. Post-closeout CLI contract fixes (playlist JSON, alias precedence, startup JSON diagnostics)
+14. `[x]` B13. Upstream YouTube drift response from latest yt-dlp client/POT changes
 
 ---
 
@@ -280,6 +282,22 @@ Make `ytv1` a practical **YouTube-focused** CLI substitute for yt-dlp in daily o
 - Acceptance:
   - JSON modes emit JSON-only stdout, alias precedence is deterministic by argument order, and startup failures are covered by tests.
 
+### B13. Upstream YouTube Drift Response
+- Status: `[x]`
+- Goal: Restore live extraction resilience after recent YouTube/yt-dlp client-policy changes, especially audio-only format selection failures.
+- Work:
+  1. Compare latest local `D:\yt-dlp\yt_dlp\extractor\youtube` client/POT changes.
+  2. Port relevant behavior without changing public package API.
+  3. Add focused regression tests for default client order, new client profile availability, embedded request shaping, and PO token sanitization.
+- Target files:
+  - `internal/innertube/*`
+  - `internal/policy/*`
+  - `internal/orchestrator/*`
+  - `docs/IMPLEMENTATION_PLAN.md`
+- Acceptance:
+  - `go test ./...` remains green and the plan records the exact yt-dlp drift response.
+  - Live-gated audio-only smoke passes for the default E2E video.
+
 ---
 
 ## 4. Public API Contract
@@ -327,6 +345,8 @@ Cycle B is complete only when all are true:
 - `2026-02-16`: B10 compatibility follow-up: added `--dump-single-json` parser/emit path and yt-dlp-style payload serialization with CLI regression tests to improve external tool interoperability.
 - `2026-02-16`: B10 compatibility follow-up: aligned `--print-json` output path with `--dump-single-json` yt-dlp-style payload emission so callers that pass only `-J/--print-json` (e.g. mpv ytdl-hook variants) receive a playable `url` field.
 - `2026-05-04`: Completed `B12` by removing human playlist stdout from JSON modes, enforcing last-flag-wins alias resolution for conflicting CLI flags, and routing startup/configuration failures through the structured JSON diagnostics path; verified with `go test ./...`.
+- `2026-05-27`: Started `B13` after comparing latest local `D:\yt-dlp` YouTube changes for default clients, `web_creator`, `web_embedded`, and PO token cleanup.
+- `2026-05-27`: Completed `B13` by aligning default clients with yt-dlp (`android_vr`, `web_safari`; authenticated `tv_downgraded`, `web_safari`), adding `web_creator`, changing embedded third-party context to a non-YouTube origin, sanitizing base64url PO tokens before player requests, and making audio-only downloads fall back to `best` when YouTube exposes no playable audio-only URL; verified with `go test ./...` and `YTV1_E2E=1 go test ./client -run TestE2E_ -count=1 -timeout 8m`.
 
 ---
 

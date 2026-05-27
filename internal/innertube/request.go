@@ -136,7 +136,7 @@ func NewPlayerRequest(profile ClientProfile, videoID string, opts ...PlayerReque
 
 	if profile.Screen == "EMBED" {
 		req.Context.ThirdParty = &ThirdParty{
-			EmbedUrl: "https://www.youtube.com/",
+			EmbedUrl: "https://www.reddit.com/",
 		}
 	}
 

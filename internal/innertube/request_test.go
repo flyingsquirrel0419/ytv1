@@ -35,8 +35,8 @@ func TestNewPlayerRequestEmbeddedContext(t *testing.T) {
 	if req.Context.ThirdParty == nil {
 		t.Fatalf("expected thirdParty embed context")
 	}
-	if req.Context.ThirdParty.EmbedUrl == "" {
-		t.Fatalf("expected embed url")
+	if req.Context.ThirdParty.EmbedUrl != "https://www.reddit.com/" {
+		t.Fatalf("embed url = %q, want non-YouTube embed origin", req.Context.ThirdParty.EmbedUrl)
 	}
 }
 

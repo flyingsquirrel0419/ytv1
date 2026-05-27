@@ -96,6 +96,10 @@ func TestWatchPageURLForProfile(t *testing.T) {
 	if got := watchPageURLForProfile(embedded, "abc123xyz00"); got != "https://www.youtube.com/embed/abc123xyz00?html5=1" {
 		t.Fatalf("embedded url=%q", got)
 	}
+	creator := WebCreatorClient
+	if got := watchPageURLForProfile(creator, "abc123xyz00"); got != "https://studio.youtube.com" {
+		t.Fatalf("creator url=%q", got)
+	}
 	tv := TVClient
 	if got := watchPageURLForProfile(tv, "abc123xyz00"); got != "https://www.youtube.com/tv" {
 		t.Fatalf("tv url=%q", got)

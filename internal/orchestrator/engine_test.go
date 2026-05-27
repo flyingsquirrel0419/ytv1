@@ -126,13 +126,13 @@ func TestEngineSkipsFallbackOnHTTPFailureOnly(t *testing.T) {
 
 func TestEngineInjectsPoTokenWhenProviderConfigured(t *testing.T) {
 	web := innertube.WebClient
-	provider := &poTokenProviderStub{token: "po-token-123"}
+	provider := &poTokenProviderStub{token: "cG8tdG9rZW4tMTIz"}
 	var sawPoToken int32
 
 	tr := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		body, _ := io.ReadAll(r.Body)
 		payload := string(body)
-		if strings.Contains(payload, `"poToken":"po-token-123"`) {
+		if strings.Contains(payload, `"poToken":"cG8tdG9rZW4tMTIz"`) {
 			atomic.StoreInt32(&sawPoToken, 1)
 		}
 		return &http.Response{
@@ -162,6 +162,40 @@ func TestEngineInjectsPoTokenWhenProviderConfigured(t *testing.T) {
 	}
 	if atomic.LoadInt32(&sawPoToken) == 0 {
 		t.Fatalf("expected poToken in request payload")
+	}
+}
+
+func TestEngineCleansPoTokenBeforeInjection(t *testing.T) {
+	web := innertube.WebClient
+	provider := &poTokenProviderStub{token: "cG8tdG9rZW4tMTIz%3Ffoo%3Dbar&baz=1"}
+	var sawPoToken int32
+
+	tr := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), `"poToken":"cG8tdG9rZW4tMTIz"`) {
+			atomic.StoreInt32(&sawPoToken, 1)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(bytes.NewBufferString(`{"playabilityStatus":{"status":"OK"},"videoDetails":{"videoId":"jNQXAC9IVRw","title":"ok","author":"yt"}}`)),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	engine := NewEngine(
+		selectorStub{clients: []innertube.ClientProfile{web}},
+		innertube.Config{
+			HTTPClient:      &http.Client{Transport: tr},
+			PoTokenProvider: provider,
+		},
+	)
+
+	_, err := engine.GetVideoInfo(context.Background(), "jNQXAC9IVRw")
+	if err != nil {
+		t.Fatalf("GetVideoInfo() error = %v", err)
+	}
+	if atomic.LoadInt32(&sawPoToken) == 0 {
+		t.Fatalf("expected cleaned poToken in request payload")
 	}
 }
 

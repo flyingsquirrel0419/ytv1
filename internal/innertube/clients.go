@@ -47,6 +47,36 @@ var (
 		Screen:          "EMBED",
 	}
 
+	// WebCreatorClient mirrors yt-dlp's "web_creator" profile used for
+	// authenticated/premium fallbacks.
+	WebCreatorClient = ClientProfile{
+		ID:              "web_creator",
+		Name:            "WEB_CREATOR",
+		Version:         "1.20260114.03.00",
+		ContextNameID:   62,
+		UserAgent:       WebClient.UserAgent,
+		APIKey:          defaultInnertubeAPIKey,
+		SupportsCookies: true,
+		RequiresAuth:    true,
+		Host:            "studio.youtube.com",
+		PoTokenPolicy: map[VideoStreamingProtocol]PoTokenPolicy{
+			StreamingProtocolHTTPS: {
+				Required:              true,
+				Recommended:           true,
+				NotRequiredForPremium: true,
+			},
+			StreamingProtocolDASH: {
+				Required:              true,
+				Recommended:           true,
+				NotRequiredForPremium: true,
+			},
+			StreamingProtocolHLS: {
+				Required:    false,
+				Recommended: true,
+			},
+		},
+	}
+
 	// WebSafariClient mirrors yt-dlp's "web_safari" strategy using WEB clientName
 	// with a Safari UA profile.
 	WebSafariClient = ClientProfile{

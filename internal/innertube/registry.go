@@ -13,6 +13,7 @@ func NewRegistry() Registry {
 		clients: map[string]ClientProfile{
 			"web":                 WebClient,
 			"web_safari":          WebSafariClient,
+			"web_creator":         WebCreatorClient,
 			"web_embedded":        WebEmbeddedClient,
 			"web_embedded_player": WebEmbeddedClient,
 			"mweb":                MWebClient,

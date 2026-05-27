@@ -112,3 +112,30 @@ func TestE2E_DSYF_DownloadSmoke(t *testing.T) {
 		t.Fatalf("output file missing: %v", statErr)
 	}
 }
+
+func TestE2E_DSYF_DownloadAudioOnlySmoke(t *testing.T) {
+	videoID := requireE2E(t)
+
+	out := filepath.Join(t.TempDir(), "e2e-audio-only.webm")
+	c := newE2EClient()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	res, err := c.Download(ctx, videoID, DownloadOptions{
+		OutputPath: out,
+		Mode:       SelectionModeAudioOnly,
+	})
+	if err != nil {
+		t.Fatalf("Download(audioonly) error = %v", err)
+	}
+	if res == nil {
+		t.Fatal("Download(audioonly) result is nil")
+	}
+	if res.Bytes <= 0 {
+		t.Fatalf("Download(audioonly) bytes=%d, want >0", res.Bytes)
+	}
+	if _, statErr := os.Stat(out); statErr != nil {
+		t.Fatalf("audio-only output file missing: %v", statErr)
+	}
+}
