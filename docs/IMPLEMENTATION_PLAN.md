@@ -187,6 +187,7 @@
 - B127 completion increment landed: moved metadata/get/print rendering and print-to-file append workflow from `cmd/ytv1/main.go` into package APIs.
 - B128 completion increment landed: moved diagnostics/remediation and lifecycle event formatting from `cmd/ytv1/main.go` into package APIs.
 - B129 completion increment landed: split remaining CLI adapter helpers and video workflow out of `cmd/ytv1/main.go`, leaving `main.go` as a thin entrypoint/run-loop wrapper over package and command adapters.
+- B130 completion increment landed: explicit video-only `video/mp4; codecs="avc1..."` entries no longer inherit progressive audio flags, while codec-less progressive fallback remains intact; verified against `oaevSXpWhdo` and `go test ./...`.
 
 ### 1.4 Immediate Next Tasks (Strict Order)
 1. `[x]` B0. Rebaseline and target-definition reset for Cycle B
@@ -319,6 +320,7 @@
 128. `[x]` B127. Thin CLI refactor for metadata print workflow
 129. `[x]` B128. Thin CLI refactor for diagnostics and lifecycle formatting
 130. `[x]` B129. Thin `cmd/ytv1/main.go` entrypoint split
+131. `[x]` B130. Explicit codec media-flag correction for video-only MP4 formats
 
 ---
 
@@ -2702,6 +2704,7 @@ Cycle B is complete only when all are true:
 - `2026-05-29`: Completed `B127` by adding package-level metadata print request/result rendering plus print-to-file path/append helpers, reducing CLI metadata output to option mapping and stdout/file dispatch, and verifying with `go test ./...`.
 - `2026-05-29`: Completed `B128` by adding package-level diagnostics/remediation hint generation and lifecycle event formatting/timing helpers, reducing CLI diagnostics to print dispatch, and verifying with `go test ./...`.
 - `2026-05-30`: Completed `B129` by moving the video workflow body to `cmd/ytv1/video_workflow.go` and remaining CLI adapter helpers to `cmd/ytv1/adapters.go`, reducing `cmd/ytv1/main.go` to the entrypoint/startup/run-loop layer and verifying with `go test ./...`.
+- `2026-05-30`: Completed `B130` by trusting explicit codec metadata before progressive AV fallback, preventing video-only MP4 formats from being marked audio-capable, preserving codec-less progressive fallback behavior, verifying `oaevSXpWhdo` selection (`299+251`) and `-F` notes, and running `go test ./...`.
 
 ---
 

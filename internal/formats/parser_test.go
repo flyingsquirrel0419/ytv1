@@ -137,6 +137,56 @@ func TestParse_MissingAndInvalidFields(t *testing.T) {
 	}
 }
 
+func TestParse_ExplicitVideoOnlyProgressiveDoesNotInferAudio(t *testing.T) {
+	resp := &innertube.PlayerResponse{
+		StreamingData: innertube.StreamingData{
+			Formats: []innertube.Format{
+				{
+					Itag:     134,
+					URL:      "https://example.com/v.mp4",
+					MimeType: `video/mp4; codecs="avc1.4d401e"`,
+					Width:    640,
+					Height:   360,
+					Bitrate:  500000,
+				},
+			},
+		},
+	}
+
+	out := Parse(resp)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 format, got %d", len(out))
+	}
+	if out[0].HasAudio || !out[0].HasVideo {
+		t.Fatalf("expected explicit video-only progressive format, got hasAudio=%v hasVideo=%v", out[0].HasAudio, out[0].HasVideo)
+	}
+}
+
+func TestParse_ProgressiveWithoutCodecsStillInfersAudio(t *testing.T) {
+	resp := &innertube.PlayerResponse{
+		StreamingData: innertube.StreamingData{
+			Formats: []innertube.Format{
+				{
+					Itag:     18,
+					URL:      "https://example.com/v.mp4",
+					MimeType: "video/mp4",
+					Width:    640,
+					Height:   360,
+					Bitrate:  500000,
+				},
+			},
+		},
+	}
+
+	out := Parse(resp)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 format, got %d", len(out))
+	}
+	if !out[0].HasAudio || !out[0].HasVideo {
+		t.Fatalf("expected codec-less progressive fallback to infer AV, got hasAudio=%v hasVideo=%v", out[0].HasAudio, out[0].HasVideo)
+	}
+}
+
 func TestParse_UnknownProtocolWhenURLSignalsMissing(t *testing.T) {
 	resp := &innertube.PlayerResponse{
 		StreamingData: innertube.StreamingData{

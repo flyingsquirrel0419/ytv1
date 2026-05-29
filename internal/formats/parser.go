@@ -155,6 +155,7 @@ func parseMimeDetails(raw string) (container string, codecs []string) {
 
 func deriveMediaFlags(f Format, adaptive bool) (hasAudio bool, hasVideo bool) {
 	mimeType := strings.ToLower(f.MimeType)
+	hasExplicitCodecs := len(f.Codecs) > 0
 
 	if strings.HasPrefix(mimeType, "audio/") {
 		hasAudio = true
@@ -164,6 +165,9 @@ func deriveMediaFlags(f Format, adaptive bool) (hasAudio bool, hasVideo bool) {
 	}
 
 	if f.AudioChannels > 0 || f.AudioSampleRate > 0 {
+		hasAudio = true
+	}
+	if strings.TrimSpace(f.AudioQuality) != "" {
 		hasAudio = true
 	}
 	if f.Width > 0 || f.Height > 0 || f.FPS > 0 {
@@ -180,8 +184,9 @@ func deriveMediaFlags(f Format, adaptive bool) (hasAudio bool, hasVideo bool) {
 		}
 	}
 
-	// Progressive entries (non-adaptive) usually include both tracks.
-	if !adaptive && hasVideo && !hasAudio {
+	// Progressive entries without codec details usually include both tracks.
+	// When codecs are explicit, trust them so video-only MP4 is not labeled AV.
+	if !adaptive && hasVideo && !hasAudio && !hasExplicitCodecs {
 		hasAudio = true
 	}
 
