@@ -1551,11 +1551,11 @@ func TestParseSubtitleLanguages(t *testing.T) {
 }
 
 func TestApplySubtitleLanguageExclusions(t *testing.T) {
-	got := applySubtitleLanguageExclusions(parseSubtitleLanguages("en,ko,-ko,en"))
+	got := client.ApplySubtitleLanguageExclusions(parseSubtitleLanguages("en,ko,-ko,en"))
 	if strings.Join(got, ",") != "en" {
 		t.Fatalf("languages=%v, want [en]", got)
 	}
-	got = applySubtitleLanguageExclusions(parseSubtitleLanguages("-ko"))
+	got = client.ApplySubtitleLanguageExclusions(parseSubtitleLanguages("-ko"))
 	if len(got) != 0 {
 		t.Fatalf("languages=%v, want empty after exclusion-only request", got)
 	}
@@ -1755,13 +1755,13 @@ func TestURLLinkOutputPath_Template(t *testing.T) {
 
 func TestWriteURLLinkSidecar(t *testing.T) {
 	dir := t.TempDir()
-	err := writeURLLinkSidecar("https://youtu.be/jNQXAC9IVRw", &client.VideoInfo{
+	err := writeShortcutSidecar("https://youtu.be/jNQXAC9IVRw", &client.VideoInfo{
 		ID:    "jNQXAC9IVRw",
 		Title: "Me at the zoo",
 	}, cli.Options{
 		OutputTemplate: filepath.Join(dir, "%(title)s.%(ext)s"),
 		Quiet:          true,
-	})
+	}, shortcutURL)
 	if err != nil {
 		t.Fatalf("writeURLLinkSidecar() error = %v", err)
 	}
@@ -1781,11 +1781,11 @@ func TestWriteURLLinkSidecar_NoOverwrites(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old"), 0644); err != nil {
 		t.Fatalf("write existing url link: %v", err)
 	}
-	err := writeURLLinkSidecar("https://youtu.be/jNQXAC9IVRw", &client.VideoInfo{ID: "jNQXAC9IVRw"}, cli.Options{
+	err := writeShortcutSidecar("https://youtu.be/jNQXAC9IVRw", &client.VideoInfo{ID: "jNQXAC9IVRw"}, cli.Options{
 		OutputTemplate: filepath.Join(dir, "%(id)s.%(ext)s"),
 		NoOverwrites:   true,
 		Quiet:          true,
-	})
+	}, shortcutURL)
 	if err != nil {
 		t.Fatalf("writeURLLinkSidecar() error = %v", err)
 	}

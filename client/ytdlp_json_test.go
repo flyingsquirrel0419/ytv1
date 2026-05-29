@@ -49,3 +49,17 @@ func TestBuildYTDLPPlaylistInfoJSON(t *testing.T) {
 		t.Fatalf("entries=%+v", payload.Entries)
 	}
 }
+
+func TestPlaylistInfoAsVideoInfo(t *testing.T) {
+	got := PlaylistInfoAsVideoInfo(&PlaylistInfo{
+		ID:         "PL123",
+		Title:      "Playlist",
+		Channel:    "Channel",
+		ChannelID:  "UC123",
+		Uploader:   "Uploader",
+		UploaderID: "UU123",
+	})
+	if got.ID != "PL123" || got.Title != "Playlist" || got.Author != "Uploader" || got.ChannelID != "UC123" {
+		t.Fatalf("PlaylistInfoAsVideoInfo()=%+v", got)
+	}
+}

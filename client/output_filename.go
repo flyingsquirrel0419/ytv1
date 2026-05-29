@@ -176,6 +176,38 @@ func NormalizeMergeOutputExt(raw string) string {
 	return ext
 }
 
+// RemuxVideoTargetExt derives the first practical target container from a
+// yt-dlp-style remux rule string such as "webm>mp4/mkv".
+func RemuxVideoTargetExt(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, "/")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if i := strings.LastIndex(part, ">"); i >= 0 {
+			part = strings.TrimSpace(part[i+1:])
+		}
+		if part != "" {
+			return part
+		}
+	}
+	return raw
+}
+
+// EffectiveMergeOutputExt resolves explicit merge-output preference first,
+// then a remux-video rule, and finally the package default.
+func EffectiveMergeOutputExt(mergeOutputFormat string, remuxVideo string) string {
+	if strings.TrimSpace(mergeOutputFormat) != "" {
+		return NormalizeMergeOutputExt(mergeOutputFormat)
+	}
+	return NormalizeMergeOutputExt(RemuxVideoTargetExt(remuxVideo))
+}
+
 // TrimOutputPathFilename limits the final path basename while preserving directories/extensions.
 func TrimOutputPathFilename(path string, limit int) string {
 	if limit <= 0 {

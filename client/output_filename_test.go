@@ -52,3 +52,15 @@ func TestPredictOutputFilename_RestrictedSingleTemplate(t *testing.T) {
 		t.Fatalf("PredictOutputFilename()=%q, want A_title_symbol.mp4", got)
 	}
 }
+
+func TestEffectiveMergeOutputExt(t *testing.T) {
+	if got := EffectiveMergeOutputExt("mkv", "webm>mp4"); got != "mkv" {
+		t.Fatalf("EffectiveMergeOutputExt()=%q, want mkv", got)
+	}
+	if got := EffectiveMergeOutputExt("", "webm>mp4/mkv"); got != "mp4" {
+		t.Fatalf("EffectiveMergeOutputExt(remux)=%q, want mp4", got)
+	}
+	if got := EffectiveMergeOutputExt("", ""); got != "mp4" {
+		t.Fatalf("EffectiveMergeOutputExt(default)=%q, want mp4", got)
+	}
+}

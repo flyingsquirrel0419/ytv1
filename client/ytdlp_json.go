@@ -101,6 +101,21 @@ func BuildYTDLPPlaylistInfoJSON(playlist *PlaylistInfo) YTDLPPlaylistInfoJSON {
 	}
 }
 
+// PlaylistInfoAsVideoInfo adapts playlist-level metadata for sidecar path
+// rendering APIs that operate on VideoInfo-shaped template data.
+func PlaylistInfoAsVideoInfo(playlist *PlaylistInfo) *VideoInfo {
+	if playlist == nil {
+		return &VideoInfo{}
+	}
+	author := firstNonEmpty(playlist.Uploader, playlist.Channel)
+	return &VideoInfo{
+		ID:        playlist.ID,
+		Title:     playlist.Title,
+		Author:    author,
+		ChannelID: firstNonEmpty(playlist.ChannelID, playlist.UploaderID),
+	}
+}
+
 // BuildYTDLPDumpSingleJSON builds a yt-dlp-style single video payload.
 func BuildYTDLPDumpSingleJSON(input string, info *VideoInfo) YTDLPDumpSingleJSON {
 	if info == nil {

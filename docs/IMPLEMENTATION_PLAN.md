@@ -182,6 +182,11 @@
 - B122 completion increment landed: thumbnail sidecar download transport moved from `cmd/ytv1/main.go` into package API.
 - B123 completion increment landed: description sidecar file writing moved from `cmd/ytv1/main.go` into package API.
 - B124 completion increment landed: shortcut sidecar file writing moved from `cmd/ytv1/main.go` into package API.
+- B125 completion increment landed: moved reusable download option construction, output-template composition, remux/merge extension resolution, selected stream URL resolution, info JSON sidecar writing, and playlist metadata adaptation from `cmd/ytv1/main.go` into package-level `client` APIs.
+- B126 completion increment landed: moved requested subtitle sidecar workflow, playlist item run accounting/template context, and list-output rendering from `cmd/ytv1/main.go` into package APIs.
+- B127 completion increment landed: moved metadata/get/print rendering and print-to-file append workflow from `cmd/ytv1/main.go` into package APIs.
+- B128 completion increment landed: moved diagnostics/remediation and lifecycle event formatting from `cmd/ytv1/main.go` into package APIs.
+- B129 completion increment landed: split remaining CLI adapter helpers and video workflow out of `cmd/ytv1/main.go`, leaving `main.go` as a thin entrypoint/run-loop wrapper over package and command adapters.
 
 ### 1.4 Immediate Next Tasks (Strict Order)
 1. `[x]` B0. Rebaseline and target-definition reset for Cycle B
@@ -309,6 +314,11 @@
 123. `[x]` B122. Thin CLI refactor for thumbnail download
 124. `[x]` B123. Thin CLI refactor for description sidecar writing
 125. `[x]` B124. Thin CLI refactor for shortcut sidecar writing
+126. `[x]` B125. Thin CLI refactor for reusable download/output planning helpers
+127. `[x]` B126. Thin CLI refactor for subtitle, playlist-run, and list-output workflows
+128. `[x]` B127. Thin CLI refactor for metadata print workflow
+129. `[x]` B128. Thin CLI refactor for diagnostics and lifecycle formatting
+130. `[x]` B129. Thin `cmd/ytv1/main.go` entrypoint split
 
 ---
 
@@ -2341,6 +2351,94 @@ Make `ytv1` a practical **YouTube-focused** CLI substitute for yt-dlp in daily o
 - Acceptance:
   - Package callers can write shortcut sidecars directly, `cmd/ytv1/main.go` no longer owns shortcut directory/file write logic, and `go test ./...` remains green.
 
+### B125. Thin CLI Refactor for Reusable Download/Output Planning Helpers
+- Status: `[x]`
+- Goal: Move reusable download option construction, output-template composition, merge/remux extension policy, selected stream URL resolution, info JSON sidecar writing, and playlist metadata adaptation from `cmd/ytv1/main.go` into package APIs.
+- Work:
+  1. Add package APIs for common download-option alias mapping and output template directory/ID shortcut composition without depending on the CLI parser package.
+  2. Add package APIs for selected stream URL resolution and merge/remux extension resolution.
+  3. Add package APIs for video and playlist `.info.json` sidecar writing.
+  4. Keep CLI responsible for parsing flags, overwrite checks, and user-facing output, while calling package helpers for reusable behavior.
+- Target files:
+  - `client/download_options.go`
+  - `client/download_options_test.go`
+  - `client/info_json_sidecar.go`
+  - `client/info_json_sidecar_test.go`
+  - `client/stream_urls.go`
+  - `client/stream_urls_test.go`
+  - `client/output_filename.go`
+  - `client/output_filename_test.go`
+  - `client/ytdlp_json.go`
+  - `client/ytdlp_json_test.go`
+  - `cmd/ytv1/main.go`
+  - `docs/IMPLEMENTATION_PLAN.md`
+- Acceptance:
+  - Package callers can build download options, compose output templates, resolve selected stream URLs, derive merge/remux extensions, write info JSON sidecars, and adapt playlist metadata without `cmd/ytv1`; `go test ./...` remains green.
+
+### B126. Thin CLI Refactor for Subtitle, Playlist-Run, and List-Output Workflows
+- Status: `[x]`
+- Goal: Move reusable subtitle sidecar workflow, playlist item processing accounting, playlist template rendering, and list-output rendering from `cmd/ytv1/main.go` into package APIs.
+- Work:
+  1. Add package API for requested subtitle sidecar writes using transcript/subtitle-track APIs and shared sidecar path policy.
+  2. Add package API for deterministic playlist item run summary/failure/skipped accounting and playlist template token rendering.
+  3. Add package output writers for format lists, subtitle track lists, and flat playlist output.
+- Target files:
+  - `client/subtitle_sidecar.go`
+  - `client/subtitle_sidecar_test.go`
+  - `client/playlist_run.go`
+  - `client/playlist_run_test.go`
+  - `client/list_output.go`
+  - `client/list_output_test.go`
+  - `cmd/ytv1/main.go`
+  - `docs/IMPLEMENTATION_PLAN.md`
+- Acceptance:
+  - Package callers can run subtitle sidecar writes, process playlist item outcomes, render playlist template context, and emit list outputs without `cmd/ytv1`; `go test ./...` remains green.
+
+### B127. Thin CLI Refactor for Metadata Print Workflow
+- Status: `[x]`
+- Goal: Move metadata/get/print rendering and print-to-file append behavior from `cmd/ytv1/main.go` into package APIs.
+- Work:
+  1. Add package request/result APIs for ordered metadata fields, print templates, selected filename/format/url rendering, and print-to-file path rendering.
+  2. Add package file append helper for print-to-file outputs.
+  3. Keep CLI responsible only for parser option mapping, stdout writes, and invoking package append behavior.
+- Target files:
+  - `client/metadata_workflow.go`
+  - `client/metadata_print.go`
+  - `client/metadata_print_test.go`
+  - `cmd/ytv1/main.go`
+  - `docs/IMPLEMENTATION_PLAN.md`
+- Acceptance:
+  - Package callers can render ordered metadata print items and append print-to-file output without `cmd/ytv1`; `go test ./...` remains green.
+
+### B128. Thin CLI Refactor for Diagnostics and Lifecycle Formatting
+- Status: `[x]`
+- Goal: Move diagnostics/remediation hint generation and lifecycle event formatting from `cmd/ytv1/main.go` into package APIs.
+- Work:
+  1. Add package helpers for remediation hints based on `AttemptDetail` and classified errors.
+  2. Add package helpers for extraction/download event formatting and lifecycle timing accumulation.
+  3. Keep CLI responsible only for choosing when to print diagnostics.
+- Target files:
+  - `client/diagnostics_format.go`
+  - `cmd/ytv1/main.go`
+  - `docs/IMPLEMENTATION_PLAN.md`
+- Acceptance:
+  - Package callers can format lifecycle events and derive remediation hints without `cmd/ytv1`; `go test ./...` remains green.
+
+### B129. Thin `cmd/ytv1/main.go` Entrypoint Split
+- Status: `[x]`
+- Goal: Keep `cmd/ytv1/main.go` focused on process entry, startup, and URL batch dispatch after reusable behavior has moved into `client`.
+- Work:
+  1. Move video workflow orchestration into a command adapter file.
+  2. Move remaining CLI-only helper adapters out of `main.go`.
+  3. Keep `main.go` as the entrypoint/run-loop wrapper.
+- Target files:
+  - `cmd/ytv1/main.go`
+  - `cmd/ytv1/video_workflow.go`
+  - `cmd/ytv1/adapters.go`
+  - `docs/IMPLEMENTATION_PLAN.md`
+- Acceptance:
+  - `cmd/ytv1/main.go` is substantially reduced and no longer owns extraction/download workflow bodies; `go test ./...` remains green.
+
 ---
 
 ## 4. Public API Contract
@@ -2599,6 +2697,11 @@ Cycle B is complete only when all are true:
 - `2026-05-29`: Completed `B123` by adding `client.WriteDescriptionSidecar`, moving description directory creation and file writing into the package layer, reducing CLI description sidecar flow to path/overwrite/UI handling, and verifying with `go test ./...`.
 - `2026-05-29`: Started `B124` to move shortcut sidecar directory/file writing out of `cmd/ytv1/main.go`.
 - `2026-05-29`: Completed `B124` by adding `client.WriteShortcutSidecar`, moving shortcut directory creation and file writing into the package layer for `.url`, `.webloc`, and `.desktop`, reducing CLI shortcut flow to path/overwrite/UI handling, and verifying with `go test ./...`.
+- `2026-05-29`: Completed `B125` by adding package-level download option construction, output template composition, remux/merge extension resolution, selected stream URL resolution, info JSON sidecar writing, and playlist metadata adaptation helpers, reducing the CLI to parser-to-package mapping for those behaviors, and verifying with `go test ./...`.
+- `2026-05-29`: Completed `B126` by adding package-level requested subtitle sidecar workflow, playlist item run accounting/template context helpers, and list-output writers for formats/subtitles/flat playlists, reducing the CLI to option mapping plus status text, and verifying with `go test ./...`.
+- `2026-05-29`: Completed `B127` by adding package-level metadata print request/result rendering plus print-to-file path/append helpers, reducing CLI metadata output to option mapping and stdout/file dispatch, and verifying with `go test ./...`.
+- `2026-05-29`: Completed `B128` by adding package-level diagnostics/remediation hint generation and lifecycle event formatting/timing helpers, reducing CLI diagnostics to print dispatch, and verifying with `go test ./...`.
+- `2026-05-30`: Completed `B129` by moving the video workflow body to `cmd/ytv1/video_workflow.go` and remaining CLI adapter helpers to `cmd/ytv1/adapters.go`, reducing `cmd/ytv1/main.go` to the entrypoint/startup/run-loop layer and verifying with `go test ./...`.
 
 ---
 
