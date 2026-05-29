@@ -3,6 +3,7 @@ ytv1*.exe
 *.test
 *.mp4
 *.m4a
+*.mkv
 /scripts/
 #/internal/playerjs/testdata/
 /*.json

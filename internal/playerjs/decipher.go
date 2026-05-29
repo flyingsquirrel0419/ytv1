@@ -51,19 +51,23 @@ func (d *Decipherer) DecipherN(n string) (string, error) {
 	fn, err := d.getNFunction()
 	if err == nil {
 		decoded, evalErr := evalJavascript(fn, n)
-		if evalErr == nil {
+		if evalErr == nil && validNOutput(decoded, n) {
 			return decoded, nil
 		}
 	}
 
 	decoded, runtimeErr := d.decipherNWithRuntime(n)
-	if runtimeErr == nil {
+	if runtimeErr == nil && validNOutput(decoded, n) {
 		return decoded, nil
 	}
 	if err != nil {
 		return "", err
 	}
 	return "", runtimeErr
+}
+
+func validNOutput(decoded, input string) bool {
+	return decoded != "" && !strings.HasSuffix(decoded, input)
 }
 
 type DecipherOperation func([]byte) []byte
@@ -292,7 +296,7 @@ type runtimeDecipherer struct {
 
 var (
 	signatureRuntimeNameRegexp = regexp.MustCompile(`const\s+[A-Za-z0-9_$]+=([A-Za-z0-9_$]+)\(16,decodeURIComponent\([^\)]*\.s\)\)`)
-	nURLRuntimeNameRegexp      = regexp.MustCompile(`([A-Za-z0-9_$]+)=function\(b\)\{try\{const\s+[A-Za-z0-9_$]+=\(new\s+g\.Mj\(b,!0\)\)\.get\("n"\)`)
+	nURLRuntimeNameRegexp      = regexp.MustCompile(`([A-Za-z0-9_$]+)=function\([A-Za-z0-9_$]+\)\{try\{const\s+[A-Za-z0-9_$]+=\(new\s+g\.[A-Za-z0-9_$]+\([A-Za-z0-9_$]+,!0\)\)\.get\("n"\)`)
 	nPathExtractRegexp         = regexp.MustCompile(`/n/([^/?]+)`)
 )
 

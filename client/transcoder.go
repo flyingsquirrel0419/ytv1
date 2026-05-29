@@ -10,6 +10,7 @@ type MP3TranscodeMetadata struct {
 	VideoID        string
 	SourceItag     int
 	SourceMimeType string
+	AudioQuality   string
 }
 
 // MP3Transcoder converts an input audio stream into MP3 bytes.

@@ -16,6 +16,9 @@ type VideoInfo struct {
 	Category        string
 	IsLive          bool
 	Keywords        []string
+	ThumbnailURL    string
+	ThumbnailWidth  int
+	ThumbnailHeight int
 	Formats         []FormatInfo
 	DashManifestURL string
 	HLSManifestURL  string
@@ -59,6 +62,7 @@ type PlaylistItem struct {
 	Author          string
 	DurationSeconds string
 	DurationSec     int64
+	PlaylistIndex   int
 }
 
 // PlaylistContinuationWarning describes a non-fatal continuation traversal issue.
@@ -82,6 +86,10 @@ type PlaylistContinuationStats struct {
 type PlaylistInfo struct {
 	ID                   string
 	Title                string
+	Uploader             string
+	UploaderID           string
+	Channel              string
+	ChannelID            string
 	Items                []PlaylistItem
 	ContinuationWarnings []PlaylistContinuationWarning
 	ContinuationStats    PlaylistContinuationStats

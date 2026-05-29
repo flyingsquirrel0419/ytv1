@@ -146,10 +146,15 @@ func (c *Client) GetPlaylist(ctx context.Context, input string) (*PlaylistInfo, 
 		return nil, err
 	}
 
+	owner := findPlaylistOwner(root)
 	info := &PlaylistInfo{
-		ID:    playlistID,
-		Title: findPlaylistTitle(root),
-		Items: findPlaylistItems(root),
+		ID:         playlistID,
+		Title:      findPlaylistTitle(root),
+		Uploader:   owner.Name,
+		UploaderID: owner.Handle,
+		Channel:    owner.Name,
+		ChannelID:  owner.ChannelID,
+		Items:      findPlaylistItems(root),
 	}
 
 	pendingContinuations := findContinuationTokens(root)
@@ -567,6 +572,121 @@ func findPlaylistTitle(root any) string {
 		}
 	})
 	return title
+}
+
+type playlistOwnerMetadata struct {
+	Name      string
+	Handle    string
+	ChannelID string
+}
+
+func findPlaylistOwner(root any) playlistOwnerMetadata {
+	var owner playlistOwnerMetadata
+	walkAny(root, func(m map[string]any) {
+		if owner.Name != "" && owner.ChannelID != "" && owner.Handle != "" {
+			return
+		}
+		if v, ok := m["playlistHeaderRenderer"].(map[string]any); ok {
+			mergePlaylistOwner(&owner, ownerFromPlaylistHeader(v))
+		}
+		if v, ok := m["playlistSidebarSecondaryInfoRenderer"].(map[string]any); ok {
+			mergePlaylistOwner(&owner, ownerFromPlaylistSidebar(v))
+		}
+	})
+	return owner
+}
+
+func mergePlaylistOwner(dst *playlistOwnerMetadata, src playlistOwnerMetadata) {
+	if dst.Name == "" {
+		dst.Name = src.Name
+	}
+	if dst.Handle == "" {
+		dst.Handle = src.Handle
+	}
+	if dst.ChannelID == "" {
+		dst.ChannelID = src.ChannelID
+	}
+}
+
+func ownerFromPlaylistHeader(m map[string]any) playlistOwnerMetadata {
+	var owner playlistOwnerMetadata
+	if ownerText, ok := m["ownerText"].(map[string]any); ok {
+		owner.Name = playlistOwnerName(getTextField(ownerText))
+		owner.ChannelID, owner.Handle = firstBrowseEndpointIdentity(ownerText)
+	}
+	if owner.Name == "" {
+		owner.Name = getTextField(m["channelHandleText"])
+	}
+	if owner.Handle == "" {
+		owner.Handle = handleFromText(getTextField(m["channelHandleText"]))
+	}
+	return owner
+}
+
+func ownerFromPlaylistSidebar(m map[string]any) playlistOwnerMetadata {
+	var owner playlistOwnerMetadata
+	if videoOwner, ok := m["videoOwner"].(map[string]any); ok {
+		if renderer, ok := videoOwner["videoOwnerRenderer"].(map[string]any); ok {
+			owner.Name = playlistOwnerName(getTextField(renderer["title"]))
+			owner.ChannelID, owner.Handle = firstBrowseEndpointIdentity(renderer)
+		}
+	}
+	return owner
+}
+
+func firstBrowseEndpointIdentity(root any) (string, string) {
+	var channelID string
+	var handle string
+	walkAny(root, func(m map[string]any) {
+		if channelID != "" && handle != "" {
+			return
+		}
+		browse, ok := m["browseEndpoint"].(map[string]any)
+		if !ok {
+			return
+		}
+		if channelID == "" {
+			channelID = getStringFromMap(browse, "browseId")
+		}
+		if handle == "" {
+			handle = handleFromText(getStringFromMap(browse, "canonicalBaseUrl"))
+		}
+	})
+	return channelID, handle
+}
+
+func playlistOwnerName(text string) string {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, "by ") {
+		text = strings.TrimSpace(strings.TrimPrefix(text, "by "))
+	}
+	if idx := strings.Index(text, " and "); idx > 0 && (strings.HasSuffix(text, " others") || strings.HasSuffix(text, " other")) {
+		text = strings.TrimSpace(text[:idx])
+	}
+	return text
+}
+
+func handleFromText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if strings.HasPrefix(text, "http://") || strings.HasPrefix(text, "https://") {
+		if u, err := url.Parse(text); err == nil {
+			text = u.Path
+		}
+	}
+	text = strings.TrimPrefix(text, "/")
+	parts := strings.Split(text, "/")
+	for _, part := range parts {
+		if strings.HasPrefix(part, "@") {
+			return part
+		}
+	}
+	if strings.HasPrefix(text, "@") {
+		return text
+	}
+	return ""
 }
 
 func findPlaylistItems(root any) []PlaylistItem {

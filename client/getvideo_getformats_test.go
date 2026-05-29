@@ -64,6 +64,10 @@ func TestGetVideoOK(t *testing.T) {
 			"lengthSeconds":"19",
 			"viewCount":"12345",
 			"channelId":"UC4QobU6STFB0P71PMvOGN5A",
+			"thumbnail":{"thumbnails":[
+				{"url":"https://i.example/small.jpg","width":120,"height":90},
+				{"url":"https://i.example/large.jpg","width":1280,"height":720}
+			]},
 			"isLiveContent":false,
 			"keywords":["zoo","classic"]
 		},
@@ -107,6 +111,9 @@ func TestGetVideoOK(t *testing.T) {
 	}
 	if len(info.Keywords) != 2 {
 		t.Fatalf("keywords len = %d, want 2", len(info.Keywords))
+	}
+	if info.ThumbnailURL != "https://i.example/large.jpg" || info.ThumbnailWidth != 1280 || info.ThumbnailHeight != 720 {
+		t.Fatalf("unexpected thumbnail: url=%q width=%d height=%d", info.ThumbnailURL, info.ThumbnailWidth, info.ThumbnailHeight)
 	}
 }
 

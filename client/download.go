@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,8 +17,14 @@ import (
 	"time"
 
 	"github.com/famomatic/ytv1/internal/downloader"
-	"github.com/famomatic/ytv1/internal/selector"
 	"github.com/famomatic/ytv1/internal/types"
+)
+
+var (
+	createFile = os.Create
+	openFile   = os.OpenFile
+	removeFile = os.Remove
+	renameFile = os.Rename
 )
 
 // DownloadOptions controls stream download behavior.
@@ -29,6 +36,10 @@ type DownloadOptions struct {
 	Resume                bool
 	MergeOutput           bool
 	KeepIntermediateFiles bool
+	UsePartFiles          bool
+	AudioQuality          string
+	NoEmbedMetadata       bool
+	MergeOutputFormat     string
 }
 
 // DownloadResult describes a completed file download.
@@ -94,96 +105,20 @@ func (c *Client) Download(ctx context.Context, input string, options DownloadOpt
 		return nil, ErrNoPlayableFormats
 	}
 
-	// 1. Determine Selector
-	selStr := options.FormatSelector
-	if selStr == "" {
-		if options.Itag > 0 {
-			// Explicit Itag: No selector needed, handled in selection
-		} else {
-			// Map Mode to selector
-			switch options.Mode {
-			case SelectionModeBest, "":
-				selStr = "bestvideo+bestaudio/best"
-			case SelectionModeMP4AV:
-				selStr = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-			case SelectionModeMP4VideoOnly:
-				selStr = "bestvideo[ext=mp4]"
-			case SelectionModeVideoOnly:
-				selStr = "bestvideo"
-			case SelectionModeAudioOnly, SelectionModeMP3:
-				selStr = "bestaudio/best"
-			default:
-				selStr = "best"
-			}
-		}
+	selected, err := SelectFormatsForDownloadOptions(formats, options)
+	if err != nil {
+		return nil, err
 	}
 
-	// 2. Select Formats
-	var selected []types.FormatInfo
-	var parsedSelector *selector.Selector
-	if options.Itag > 0 {
-		for _, f := range formats {
-			if f.Itag == options.Itag {
-				selected = []types.FormatInfo{f}
-				break
-			}
-		}
-		if len(selected) == 0 {
-			return nil, fmt.Errorf("requested itag %d not found", options.Itag)
-		}
-	} else {
-		sel, err := selector.Parse(selStr)
-		if err != nil {
-			return nil, &NoPlayableFormatsDetailError{
-				Mode:           normalizeSelectionMode(options.Mode),
-				Selector:       selStr,
-				SelectionError: "selector parse failed: " + err.Error(),
-			}
-		}
-		parsedSelector = sel
-		selected, err = selector.Select(formats, sel)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if len(selected) == 0 {
-		return nil, &NoPlayableFormatsDetailError{
-			Mode:           normalizeSelectionMode(options.Mode),
-			Selector:       selStr,
-			SelectionError: "no formats matched selector",
-		}
-	}
-
-	// Prefer decipher-free selections when available to avoid hard failure
-	// if player JS challenge solve is partial.
-	if options.Itag == 0 && parsedSelector != nil && selectionHasCiphered(selected) {
-		nonCiphered := make([]types.FormatInfo, 0, len(formats))
-		for _, f := range formats {
-			if !f.Ciphered {
-				nonCiphered = append(nonCiphered, f)
-			}
-		}
-		if len(nonCiphered) > 0 {
-			if alt, err := selector.Select(nonCiphered, parsedSelector); err == nil && len(alt) > 0 {
-				if len(alt) >= len(selected) {
-					selected = alt
-				}
-			}
-		}
-	}
-
-	// 3. Fallback for Merge if Muxer missing
+	// Fallback for Merge if Muxer missing
 	if len(selected) > 1 && (c.config.Muxer == nil || !c.config.Muxer.Available()) {
 		c.logger.Warnf("Muxer unavailable, falling back to best single file")
-		sel, _ := selector.Parse("best")
-		selected, _ = selector.Select(formats, sel)
+		selected, _ = SelectFormatsForDownloadOptions(formats, DownloadOptions{FormatSelector: "best"})
 		if len(selected) == 0 {
 			return nil, errors.New("no formats found (and muxer unavailable)")
 		}
 	}
 
-	// 4. Download
 	if len(selected) == 1 {
 		res, err := c.downloadSingle(ctx, videoID, info.Title, info.Author, selected[0], options.OutputPath, options)
 		if err != nil && errors.Is(err, ErrChallengeNotSolved) && options.Itag == 0 {
@@ -285,16 +220,23 @@ func (c *Client) downloadSingle(ctx context.Context, videoID string, title strin
 	// Previous logic: transcodeURLToMP3 handles download.
 	if options.Mode == SelectionModeMP3 {
 		c.emitDownloadEvent("download", "start", videoID, outputPath, "transcode=mp3")
-		out, err := os.Create(outputPath)
-		if err != nil {
+		var out *os.File
+		if err := retryFileAccess(ctx, c.config.DownloadTransport, func() error {
+			var err error
+			out, err = createFile(outputPath)
+			return err
+		}); err != nil {
 			c.emitDownloadEvent("download", "failure", videoID, outputPath, err.Error())
 			return nil, err
 		}
 		defer out.Close()
 
 		bytes, err := transcodeURLToMP3(ctx, c.config.HTTPClient, c.config.MP3Transcoder, streamURL, MP3TranscodeMetadata{
-			VideoID: videoID, SourceItag: f.Itag, SourceMimeType: f.MimeType,
-		}, out, c.config.RequestHeaders)
+			VideoID:        videoID,
+			SourceItag:     f.Itag,
+			SourceMimeType: f.MimeType,
+			AudioQuality:   options.AudioQuality,
+		}, out, c.config.RequestHeaders, c.config.DownloadTransport.RateLimitBytesPerSecond)
 		if err != nil {
 			c.emitDownloadEvent("download", "failure", videoID, outputPath, err.Error())
 			return nil, err
@@ -305,7 +247,7 @@ func (c *Client) downloadSingle(ctx context.Context, videoID string, title strin
 	}
 
 	c.emitDownloadEvent("download", "start", videoID, outputPath, fmt.Sprintf("itag=%d", f.Itag))
-	if err := c.downloadStream(ctx, videoID, streamURL, outputPath, f, options.Resume); err != nil {
+	if err := c.downloadStream(ctx, videoID, streamURL, outputPath, f, options.Resume, options.UsePartFiles); err != nil {
 		attempt := downloadAttemptFromFormatAndURL(f, streamURL, err)
 		c.emitDownloadEvent("download", "failure", videoID, outputPath, formatDownloadFailureDetail(attempt))
 		return nil, wrapDownloadFailure(err, attempt)
@@ -321,6 +263,10 @@ func (c *Client) downloadSingle(ctx context.Context, videoID string, title strin
 }
 
 func (c *Client) downloadAndMerge(ctx context.Context, videoID string, formats []types.FormatInfo, options DownloadOptions, meta types.Metadata) (*DownloadResult, error) {
+	if options.NoEmbedMetadata {
+		meta = types.Metadata{}
+	}
+
 	// Identify Video and Audio
 	var vidF, audF types.FormatInfo
 	foundV, foundA := false, false
@@ -341,22 +287,23 @@ func (c *Client) downloadAndMerge(ctx context.Context, videoID string, formats [
 	}
 
 	basePath := options.OutputPath
+	mergeExt := normalizedMergeOutputExt(options.MergeOutputFormat)
 	if basePath == "" {
-		basePath = fmt.Sprintf("%s-%d+%d.mp4", videoID, vidF.Itag, audF.Itag)
+		basePath = fmt.Sprintf("%s-%d+%d.%s", videoID, vidF.Itag, audF.Itag, mergeExt)
 	} else {
 		basePath = renderOutputPathTemplate(basePath, outputTemplateData{
 			VideoID:  videoID,
 			Title:    meta.Title,
 			Uploader: meta.Artist,
-			Ext:      "mp4",
+			Ext:      mergeExt,
 			Itag:     fmt.Sprintf("%d+%d", vidF.Itag, audF.Itag),
 		})
 		if strings.TrimSpace(basePath) == "" {
-			basePath = fmt.Sprintf("%s-%d+%d.mp4", videoID, vidF.Itag, audF.Itag)
+			basePath = fmt.Sprintf("%s-%d+%d.%s", videoID, vidF.Itag, audF.Itag, mergeExt)
 		}
 	}
 	if filepath.Ext(basePath) == "" {
-		basePath += ".mp4"
+		basePath += "." + mergeExt
 	}
 
 	if dir := filepath.Dir(basePath); dir != "." && dir != "" {
@@ -374,7 +321,7 @@ func (c *Client) downloadAndMerge(ctx context.Context, videoID string, formats [
 	}
 	c.emitDownloadEvent("download", "destination", videoID, videoPath, fmt.Sprintf("itag=%d", vidF.Itag))
 	c.emitDownloadEvent("download", "start", videoID, videoPath, fmt.Sprintf("itag=%d", vidF.Itag))
-	if err := c.downloadStream(ctx, videoID, vURL, videoPath, vidF, options.Resume); err != nil {
+	if err := c.downloadStream(ctx, videoID, vURL, videoPath, vidF, options.Resume, options.UsePartFiles); err != nil {
 		attempt := downloadAttemptFromFormatAndURL(vidF, vURL, err)
 		c.emitDownloadEvent("download", "failure", videoID, videoPath, formatDownloadFailureDetail(attempt))
 		return nil, wrapDownloadFailure(err, attempt)
@@ -389,7 +336,7 @@ func (c *Client) downloadAndMerge(ctx context.Context, videoID string, formats [
 	}
 	c.emitDownloadEvent("download", "destination", videoID, audioPath, fmt.Sprintf("itag=%d", audF.Itag))
 	c.emitDownloadEvent("download", "start", videoID, audioPath, fmt.Sprintf("itag=%d", audF.Itag))
-	if err := c.downloadStream(ctx, videoID, aURL, audioPath, audF, options.Resume); err != nil {
+	if err := c.downloadStream(ctx, videoID, aURL, audioPath, audF, options.Resume, options.UsePartFiles); err != nil {
 		attempt := downloadAttemptFromFormatAndURL(audF, aURL, err)
 		c.emitDownloadEvent("download", "failure", videoID, audioPath, formatDownloadFailureDetail(attempt))
 		return nil, wrapDownloadFailure(err, attempt)
@@ -413,21 +360,22 @@ func (c *Client) downloadAndMerge(ctx context.Context, videoID string, formats [
 	}, nil
 }
 
-func (c *Client) downloadStream(ctx context.Context, videoID, streamURL, outputPath string, f types.FormatInfo, resume bool) error {
+func (c *Client) downloadStream(ctx context.Context, videoID, streamURL, outputPath string, f types.FormatInfo, resume bool, usePartFiles bool) error {
 	if f.Protocol == "hls" || strings.HasSuffix(streamURL, ".m3u8") {
-		_, err := c.downloadHLS(ctx, videoID, streamURL, outputPath, f)
+		_, err := c.downloadHLS(ctx, videoID, streamURL, outputPath, f, usePartFiles)
 		return err
 	}
 	if f.Protocol == "dash" || strings.HasSuffix(streamURL, ".mpd") {
-		_, err := c.downloadDASH(ctx, videoID, streamURL, outputPath, f)
+		_, err := c.downloadDASH(ctx, videoID, streamURL, outputPath, f, usePartFiles)
 		return err
 	}
-	_, err := downloadURLToPathWithHeaders(
+	_, err := downloadURLToPathWithHeadersAndPart(
 		ctx,
 		c.config.HTTPClient,
 		streamURL,
 		outputPath,
 		resume,
+		usePartFiles,
 		c.config.DownloadTransport,
 		videoID,
 		c.config.RequestHeaders,
@@ -443,6 +391,7 @@ func transcodeURLToMP3(
 	meta MP3TranscodeMetadata,
 	dst io.Writer,
 	requestHeaders http.Header,
+	rateLimitBytesPerSecond int64,
 ) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
@@ -458,7 +407,7 @@ func transcodeURLToMP3(
 	if resp.StatusCode != http.StatusOK {
 		return 0, fmt.Errorf("download failed: status=%d", resp.StatusCode)
 	}
-	return transcoder.TranscodeToMP3(ctx, resp.Body, dst, meta)
+	return transcoder.TranscodeToMP3(ctx, rateLimitedReader(ctx, resp.Body, rateLimitBytesPerSecond), dst, meta)
 }
 
 func downloadURLToWriter(ctx context.Context, httpClient *http.Client, streamURL string, w io.Writer) (int64, error) {
@@ -487,8 +436,12 @@ func downloadURLToWriterWithConfigAndHeaders(
 	effectiveCfg := normalizeDownloadTransportConfig(cfg)
 	var lastErr error
 	for attempt := 0; attempt <= effectiveCfg.MaxRetries; attempt++ {
-		n, err := downloadURLToWriterOnce(ctx, httpClient, streamURL, w, videoID, requestHeaders)
+		var attemptBuf bytes.Buffer
+		n, err := downloadURLToWriterOnce(ctx, httpClient, streamURL, &attemptBuf, videoID, requestHeaders, effectiveCfg)
 		if err == nil {
+			if _, writeErr := w.Write(attemptBuf.Bytes()); writeErr != nil {
+				return 0, writeErr
+			}
 			return n, nil
 		}
 		lastErr = err
@@ -512,6 +465,7 @@ func downloadURLToWriterOnce(
 	w io.Writer,
 	videoID string,
 	requestHeaders http.Header,
+	cfg effectiveDownloadTransportConfig,
 ) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
@@ -527,7 +481,7 @@ func downloadURLToWriterOnce(
 	if resp.StatusCode != http.StatusOK {
 		return 0, &downloadHTTPStatusError{StatusCode: resp.StatusCode}
 	}
-	return io.Copy(w, resp.Body)
+	return copyWithDownloadConfig(ctx, w, resp.Body, cfg)
 }
 
 func downloadURLToPath(
@@ -551,6 +505,23 @@ func downloadURLToPathWithHeaders(
 	videoID string,
 	requestHeaders http.Header,
 ) (int64, error) {
+	return downloadURLToPathWithHeadersAndPart(ctx, httpClient, streamURL, outputPath, resume, false, cfg, videoID, requestHeaders)
+}
+
+func downloadURLToPathWithHeadersAndPart(
+	ctx context.Context,
+	httpClient *http.Client,
+	streamURL string,
+	outputPath string,
+	resume bool,
+	usePartFile bool,
+	cfg DownloadTransportConfig,
+	videoID string,
+	requestHeaders http.Header,
+) (int64, error) {
+	if usePartFile {
+		return downloadURLToPathPart(ctx, httpClient, streamURL, outputPath, resume, cfg, videoID, requestHeaders)
+	}
 	effectiveCfg := normalizeDownloadTransportConfig(cfg)
 	startOffset := int64(0)
 	if resume {
@@ -588,6 +559,182 @@ func downloadURLToPathWithHeaders(
 	return downloadURLFullRewrite(ctx, httpClient, streamURL, outputPath, effectiveCfg, videoID, requestHeaders)
 }
 
+func downloadURLToPathPart(
+	ctx context.Context,
+	httpClient *http.Client,
+	streamURL string,
+	outputPath string,
+	resume bool,
+	cfg DownloadTransportConfig,
+	videoID string,
+	requestHeaders http.Header,
+) (int64, error) {
+	partPath := outputPath + ".part"
+	n, err := downloadURLToPathWithHeadersAndPart(ctx, httpClient, streamURL, partPath, resume, false, cfg, videoID, requestHeaders)
+	if err != nil {
+		return 0, err
+	}
+	if err := retryFileAccess(ctx, cfg, func() error {
+		return renameFile(partPath, outputPath)
+	}); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func retryFileAccess(ctx context.Context, cfg DownloadTransportConfig, op func() error) error {
+	return retryFileAccessWithBackoff(ctx, normalizeFileAccessRetries(cfg.FileAccessRetries), cfg.FileAccessBackoff, op)
+}
+
+func retryFileAccessWithBackoff(ctx context.Context, retries int, backoff time.Duration, op func() error) error {
+	if retries < 0 {
+		retries = 0
+	}
+	if backoff <= 0 {
+		backoff = 10 * time.Millisecond
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= retries; attempt++ {
+		if err := op(); err != nil {
+			lastErr = err
+		} else {
+			return nil
+		}
+		if attempt == retries {
+			break
+		}
+		if err := waitBackoff(ctx, backoff); err != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
+func normalizeFileAccessRetries(retries int) int {
+	if retries == 0 {
+		return 3
+	}
+	if retries < 0 {
+		return 0
+	}
+	return retries
+}
+
+func copyWithRateLimit(ctx context.Context, dst io.Writer, src io.Reader, bytesPerSecond int64) (int64, error) {
+	return io.Copy(dst, rateLimitedReader(ctx, src, bytesPerSecond))
+}
+
+func copyWithDownloadConfig(ctx context.Context, dst io.Writer, src io.Reader, cfg effectiveDownloadTransportConfig) (int64, error) {
+	reader := rateLimitedReader(ctx, src, cfg.RateLimitBytesPerSecond)
+	if cfg.ThrottledRateBytesPerSecond > 0 {
+		reader = throttledRateReader(ctx, reader, cfg.ThrottledRateBytesPerSecond, cfg.ThrottledRateMinDuration)
+	}
+	return io.Copy(dst, reader)
+}
+
+func rateLimitedReader(ctx context.Context, src io.Reader, bytesPerSecond int64) io.Reader {
+	if bytesPerSecond <= 0 {
+		return src
+	}
+	return &rateLimitReader{
+		ctx:            ctx,
+		src:            src,
+		bytesPerSecond: bytesPerSecond,
+		start:          time.Now(),
+	}
+}
+
+type rateLimitReader struct {
+	ctx            context.Context
+	src            io.Reader
+	bytesPerSecond int64
+	start          time.Time
+	read           int64
+}
+
+var errThrottledDownload = errors.New("download speed below throttled-rate threshold")
+
+func throttledRateReader(ctx context.Context, src io.Reader, bytesPerSecond int64, minDuration time.Duration) io.Reader {
+	if bytesPerSecond <= 0 {
+		return src
+	}
+	if minDuration <= 0 {
+		minDuration = 3 * time.Second
+	}
+	return &throttleDetectReader{
+		ctx:            ctx,
+		src:            src,
+		bytesPerSecond: bytesPerSecond,
+		minDuration:    minDuration,
+		start:          time.Now(),
+	}
+}
+
+type throttleDetectReader struct {
+	ctx            context.Context
+	src            io.Reader
+	bytesPerSecond int64
+	minDuration    time.Duration
+	start          time.Time
+	read           int64
+	throttleStart  time.Time
+}
+
+func (r *throttleDetectReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	if n > 0 {
+		r.read += int64(n)
+		elapsed := time.Since(r.start)
+		if elapsed > 0 {
+			speed := float64(r.read) / elapsed.Seconds()
+			if speed < float64(r.bytesPerSecond) {
+				if r.throttleStart.IsZero() {
+					r.throttleStart = time.Now()
+				} else if time.Since(r.throttleStart) >= r.minDuration {
+					return n, errThrottledDownload
+				}
+			} else {
+				r.throttleStart = time.Time{}
+			}
+		}
+	}
+	if err == nil {
+		select {
+		case <-r.ctx.Done():
+			return n, r.ctx.Err()
+		default:
+		}
+	}
+	return n, err
+}
+
+func (r *rateLimitReader) Read(p []byte) (int, error) {
+	maxChunk := r.bytesPerSecond / 10
+	if maxChunk < 1 {
+		maxChunk = 1
+	}
+	if int64(len(p)) > maxChunk {
+		p = p[:maxChunk]
+	}
+	n, err := r.src.Read(p)
+	if n > 0 {
+		r.read += int64(n)
+		elapsed := time.Since(r.start)
+		target := time.Duration(float64(r.read) / float64(r.bytesPerSecond) * float64(time.Second))
+		if target > elapsed {
+			timer := time.NewTimer(target - elapsed)
+			select {
+			case <-r.ctx.Done():
+				timer.Stop()
+				return n, r.ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return n, err
+}
+
 var (
 	errRangeNotSatisfiable = errors.New("range not satisfiable")
 	errRangeNotSupported   = errors.New("range not supported")
@@ -604,15 +751,22 @@ func downloadURLRangeAppend(
 	videoID string,
 	requestHeaders http.Header,
 ) (int64, error) {
-	file, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
+	var file *os.File
+	if err := retryFileAccessWithBackoff(ctx, cfg.FileAccessRetries, cfg.FileAccessBackoff, func() error {
+		var err error
+		file, err = openFile(outputPath, os.O_RDWR, 0o644)
+		return err
+	}); err != nil {
 		return 0, err
 	}
 	defer file.Close()
 
 	var lastErr error
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
-		n, err := downloadRangeOnce(ctx, httpClient, streamURL, startOffset, file, videoID, requestHeaders)
+		if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
+			return 0, err
+		}
+		n, err := downloadRangeOnce(ctx, httpClient, streamURL, startOffset, file, videoID, requestHeaders, cfg)
 		if err == nil {
 			return n, nil
 		}
@@ -621,6 +775,12 @@ func downloadURLRangeAppend(
 		}
 		lastErr = err
 		if !isRetryableError(err, cfg) || attempt == cfg.MaxRetries {
+			return 0, err
+		}
+		if err := file.Truncate(startOffset); err != nil {
+			return 0, err
+		}
+		if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
 			return 0, err
 		}
 		if err := waitBackoff(ctx, cfg.backoffFor(attempt)); err != nil {
@@ -641,6 +801,7 @@ func downloadRangeOnce(
 	w io.Writer,
 	videoID string,
 	requestHeaders http.Header,
+	cfg effectiveDownloadTransportConfig,
 ) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, streamURL, nil)
 	if err != nil {
@@ -657,7 +818,7 @@ func downloadRangeOnce(
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
-		return io.Copy(w, resp.Body)
+		return copyWithDownloadConfig(ctx, w, resp.Body, cfg)
 	case http.StatusRequestedRangeNotSatisfiable:
 		return 0, errRangeNotSatisfiable
 	case http.StatusOK:
@@ -676,27 +837,55 @@ func downloadURLFullRewrite(
 	videoID string,
 	requestHeaders http.Header,
 ) (int64, error) {
-	file, err := os.Create(outputPath)
-	if err != nil {
+	var file *os.File
+	if err := retryFileAccessWithBackoff(ctx, cfg.FileAccessRetries, cfg.FileAccessBackoff, func() error {
+		var err error
+		file, err = createFile(outputPath)
+		return err
+	}); err != nil {
 		return 0, err
 	}
 	defer file.Close()
-	return downloadURLToWriterWithConfigAndHeaders(ctx, httpClient, streamURL, file, DownloadTransportConfig{
-		MaxRetries:       cfg.MaxRetries,
-		InitialBackoff:   cfg.InitialBackoff,
-		MaxBackoff:       cfg.MaxBackoff,
-		RetryStatusCodes: cfg.RetryStatusCodes,
-	}, videoID, requestHeaders)
+
+	var lastErr error
+	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		if err := file.Truncate(0); err != nil {
+			return 0, err
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return 0, err
+		}
+		n, err := downloadURLToWriterOnce(ctx, httpClient, streamURL, file, videoID, requestHeaders, cfg)
+		if err == nil {
+			return n, nil
+		}
+		lastErr = err
+		if !isRetryableError(err, cfg) || attempt == cfg.MaxRetries {
+			return 0, err
+		}
+		if err := waitBackoff(ctx, cfg.backoffFor(attempt)); err != nil {
+			return 0, err
+		}
+	}
+	if lastErr != nil {
+		return 0, lastErr
+	}
+	return 0, fmt.Errorf("full rewrite download failed with unknown retry error")
 }
 
 type effectiveDownloadTransportConfig struct {
-	MaxRetries       int
-	InitialBackoff   time.Duration
-	MaxBackoff       time.Duration
-	RetryStatusCodes []int
-	EnableChunked    bool
-	ChunkSize        int64
-	MaxConcurrency   int
+	MaxRetries                  int
+	InitialBackoff              time.Duration
+	MaxBackoff                  time.Duration
+	RetryStatusCodes            []int
+	EnableChunked               bool
+	ChunkSize                   int64
+	MaxConcurrency              int
+	RateLimitBytesPerSecond     int64
+	ThrottledRateBytesPerSecond int64
+	ThrottledRateMinDuration    time.Duration
+	FileAccessRetries           int
+	FileAccessBackoff           time.Duration
 }
 
 func normalizeDownloadTransportConfig(cfg DownloadTransportConfig) effectiveDownloadTransportConfig {
@@ -739,15 +928,38 @@ func normalizeDownloadTransportConfig(cfg DownloadTransportConfig) effectiveDown
 	if !enableChunked && cfg.ChunkSize == 0 && cfg.MaxConcurrency == 0 {
 		enableChunked = true
 	}
+	rateLimit := cfg.RateLimitBytesPerSecond
+	if rateLimit < 0 {
+		rateLimit = 0
+	}
+	if rateLimit > 0 {
+		enableChunked = false
+	}
+	throttledRate := cfg.ThrottledRateBytesPerSecond
+	if throttledRate < 0 {
+		throttledRate = 0
+	}
+	throttledDuration := cfg.ThrottledRateMinDuration
+	if throttledDuration <= 0 {
+		throttledDuration = 3 * time.Second
+	}
+	if throttledRate > 0 {
+		enableChunked = false
+	}
 
 	return effectiveDownloadTransportConfig{
-		MaxRetries:       maxRetries,
-		InitialBackoff:   initialBackoff,
-		MaxBackoff:       maxBackoff,
-		RetryStatusCodes: statusCodes,
-		EnableChunked:    enableChunked,
-		ChunkSize:        chunkSize,
-		MaxConcurrency:   maxConcurrency,
+		MaxRetries:                  maxRetries,
+		InitialBackoff:              initialBackoff,
+		MaxBackoff:                  maxBackoff,
+		RetryStatusCodes:            statusCodes,
+		EnableChunked:               enableChunked,
+		ChunkSize:                   chunkSize,
+		MaxConcurrency:              maxConcurrency,
+		RateLimitBytesPerSecond:     rateLimit,
+		ThrottledRateBytesPerSecond: throttledRate,
+		ThrottledRateMinDuration:    throttledDuration,
+		FileAccessRetries:           normalizeFileAccessRetries(cfg.FileAccessRetries),
+		FileAccessBackoff:           cfg.FileAccessBackoff,
 	}
 }
 
@@ -788,6 +1000,9 @@ func isRetryableError(err error, cfg effectiveDownloadTransportConfig) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	if errors.Is(err, errThrottledDownload) {
+		return true
+	}
 	var statusErr *downloadHTTPStatusError
 	if errors.As(err, &statusErr) {
 		for _, code := range cfg.RetryStatusCodes {
@@ -817,8 +1032,12 @@ func downloadURLChunked(
 		return 0, errChunkProbeFailed
 	}
 
-	file, err := os.Create(outputPath)
-	if err != nil {
+	var file *os.File
+	if err := retryFileAccessWithBackoff(ctx, cfg.FileAccessRetries, cfg.FileAccessBackoff, func() error {
+		var err error
+		file, err = createFile(outputPath)
+		return err
+	}); err != nil {
 		return 0, err
 	}
 	defer file.Close()
@@ -1081,32 +1300,70 @@ func detectOutputExt(mimeType string, mode SelectionMode) string {
 	return parts[1]
 }
 
-func (c *Client) downloadHLS(ctx context.Context, videoID, streamURL, outputPath string, format FormatInfo) (*DownloadResult, error) {
+func normalizedMergeOutputExt(raw string) string {
+	ext := strings.ToLower(strings.TrimSpace(raw))
+	ext = strings.TrimPrefix(ext, ".")
+	if ext == "" {
+		return "mp4"
+	}
+	for _, r := range ext {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		return "mp4"
+	}
+	return ext
+}
+
+func (c *Client) downloadHLS(ctx context.Context, videoID, streamURL, outputPath string, format FormatInfo, usePartFile bool) (*DownloadResult, error) {
 	headers := buildMediaRequestHeaders(c.config.RequestHeaders, videoID)
 	transport := downloader.TransportConfig{
-		MaxRetries:               c.config.DownloadTransport.MaxRetries,
-		InitialBackoff:           c.config.DownloadTransport.InitialBackoff,
-		MaxBackoff:               c.config.DownloadTransport.MaxBackoff,
-		RetryStatusCodes:         append([]int(nil), c.config.DownloadTransport.RetryStatusCodes...),
-		MaxConcurrency:           c.config.DownloadTransport.MaxConcurrency,
-		SkipUnavailableFragments: c.config.DownloadTransport.SkipUnavailableFragments,
-		MaxSkippedFragments:      c.config.DownloadTransport.MaxSkippedFragments,
+		MaxRetries:                  c.config.DownloadTransport.MaxRetries,
+		InitialBackoff:              c.config.DownloadTransport.InitialBackoff,
+		MaxBackoff:                  c.config.DownloadTransport.MaxBackoff,
+		RetryStatusCodes:            append([]int(nil), c.config.DownloadTransport.RetryStatusCodes...),
+		MaxConcurrency:              c.config.DownloadTransport.MaxConcurrency,
+		SkipUnavailableFragments:    c.config.DownloadTransport.SkipUnavailableFragments,
+		MaxSkippedFragments:         c.config.DownloadTransport.MaxSkippedFragments,
+		ThrottledRateBytesPerSecond: c.config.DownloadTransport.ThrottledRateBytesPerSecond,
+		ThrottledRateMinDuration:    c.config.DownloadTransport.ThrottledRateMinDuration,
 	}
 	dl := downloader.NewHLSDownloader(c.config.HTTPClient, streamURL).
 		WithRequestHeaders(headers).
 		WithTransportConfig(transport)
 
-	f, err := os.Create(outputPath)
-	if err != nil {
+	writePath := outputPath
+	if usePartFile {
+		writePath += ".part"
+	}
+	var f *os.File
+	if err := retryFileAccess(ctx, c.config.DownloadTransport, func() error {
+		var err error
+		f, err = createFile(writePath)
+		return err
+	}); err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	if err := dl.Download(ctx, f); err != nil {
-		return nil, err
+	downloadErr := dl.Download(ctx, f)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if downloadErr != nil {
+		return nil, downloadErr
 	}
-
-	f.Sync()
+	if syncErr != nil {
+		return nil, syncErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if usePartFile {
+		if err := retryFileAccess(ctx, c.config.DownloadTransport, func() error {
+			return renameFile(writePath, outputPath)
+		}); err != nil {
+			return nil, err
+		}
+	}
 
 	info, err := os.Stat(outputPath)
 	size := int64(0)
@@ -1122,33 +1379,56 @@ func (c *Client) downloadHLS(ctx context.Context, videoID, streamURL, outputPath
 	}, nil
 }
 
-func (c *Client) downloadDASH(ctx context.Context, videoID, streamURL, outputPath string, format FormatInfo) (*DownloadResult, error) {
+func (c *Client) downloadDASH(ctx context.Context, videoID, streamURL, outputPath string, format FormatInfo, usePartFile bool) (*DownloadResult, error) {
 	repID := fmt.Sprintf("%d", format.Itag)
 	headers := buildMediaRequestHeaders(c.config.RequestHeaders, videoID)
 	transport := downloader.TransportConfig{
-		MaxRetries:               c.config.DownloadTransport.MaxRetries,
-		InitialBackoff:           c.config.DownloadTransport.InitialBackoff,
-		MaxBackoff:               c.config.DownloadTransport.MaxBackoff,
-		RetryStatusCodes:         append([]int(nil), c.config.DownloadTransport.RetryStatusCodes...),
-		MaxConcurrency:           c.config.DownloadTransport.MaxConcurrency,
-		SkipUnavailableFragments: c.config.DownloadTransport.SkipUnavailableFragments,
-		MaxSkippedFragments:      c.config.DownloadTransport.MaxSkippedFragments,
+		MaxRetries:                  c.config.DownloadTransport.MaxRetries,
+		InitialBackoff:              c.config.DownloadTransport.InitialBackoff,
+		MaxBackoff:                  c.config.DownloadTransport.MaxBackoff,
+		RetryStatusCodes:            append([]int(nil), c.config.DownloadTransport.RetryStatusCodes...),
+		MaxConcurrency:              c.config.DownloadTransport.MaxConcurrency,
+		SkipUnavailableFragments:    c.config.DownloadTransport.SkipUnavailableFragments,
+		MaxSkippedFragments:         c.config.DownloadTransport.MaxSkippedFragments,
+		ThrottledRateBytesPerSecond: c.config.DownloadTransport.ThrottledRateBytesPerSecond,
+		ThrottledRateMinDuration:    c.config.DownloadTransport.ThrottledRateMinDuration,
 	}
 	dl := downloader.NewDASHDownloader(c.config.HTTPClient, streamURL, repID).
 		WithRequestHeaders(headers).
 		WithTransportConfig(transport)
 
-	f, err := os.Create(outputPath)
-	if err != nil {
+	writePath := outputPath
+	if usePartFile {
+		writePath += ".part"
+	}
+	var f *os.File
+	if err := retryFileAccess(ctx, c.config.DownloadTransport, func() error {
+		var err error
+		f, err = createFile(writePath)
+		return err
+	}); err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	if err := dl.Download(ctx, f); err != nil {
-		return nil, err
+	downloadErr := dl.Download(ctx, f)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if downloadErr != nil {
+		return nil, downloadErr
 	}
-
-	f.Sync()
+	if syncErr != nil {
+		return nil, syncErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	if usePartFile {
+		if err := retryFileAccess(ctx, c.config.DownloadTransport, func() error {
+			return renameFile(writePath, outputPath)
+		}); err != nil {
+			return nil, err
+		}
+	}
 
 	info, err := os.Stat(outputPath)
 	size := int64(0)
@@ -1181,7 +1461,10 @@ func (c *Client) cleanupIntermediateFile(videoID, path string, keep bool) {
 		return
 	}
 	c.emitDownloadEvent("cleanup", "delete", videoID, path, "")
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	err := retryFileAccess(context.Background(), c.config.DownloadTransport, func() error {
+		return removeFile(path)
+	})
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		c.emitDownloadEvent("cleanup", "failure", videoID, path, err.Error())
 		return
 	}

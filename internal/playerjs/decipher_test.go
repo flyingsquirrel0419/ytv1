@@ -3,6 +3,7 @@ package playerjs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,5 +104,19 @@ MzD=function(b){try{const R=(new g.Mj(b,!0)).get("n");if(R){const h=b.match(/\/n
 	}
 	if got != "fedcba" {
 		t.Fatalf("DecipherN() runtime fallback = %q, want %q", got, "fedcba")
+	}
+}
+
+func TestDecipherN_CurrentBaseJSFixture(t *testing.T) {
+	js := loadFixture(t, "base.js")
+	d := NewDecipherer(js)
+
+	const input = "0LR3IEsTpf4o6AB3N_-_w8_"
+	got, err := d.DecipherN(input)
+	if err != nil {
+		t.Fatalf("DecipherN() current base.js error = %v", err)
+	}
+	if got == "" || strings.HasSuffix(got, input) {
+		t.Fatalf("DecipherN() current base.js returned invalid output %q for input %q", got, input)
 	}
 }

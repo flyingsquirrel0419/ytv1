@@ -12,7 +12,7 @@ func withDefaultTimeout(ctx context.Context, timeout time.Duration) (context.Con
 	if timeout <= 0 {
 		return ctx, func() {}
 	}
-	if _, ok := ctx.Deadline(); ok {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= timeout {
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, timeout)

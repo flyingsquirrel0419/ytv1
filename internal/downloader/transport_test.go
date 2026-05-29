@@ -38,6 +38,42 @@ func TestDoGETBytesWithRetry_RetriesOn429(t *testing.T) {
 	}
 }
 
+func TestDoGETBytesWithRetry_RetriesOnThrottledRate(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < 8; i++ {
+				_, _ = w.Write([]byte("x"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+			return
+		}
+		w.Write([]byte("fragment-ok"))
+	}))
+	defer server.Close()
+
+	body, err := doGETBytesWithRetry(context.Background(), server.Client(), server.URL, nil, TransportConfig{
+		MaxRetries:                  1,
+		InitialBackoff:              time.Millisecond,
+		MaxBackoff:                  time.Millisecond,
+		ThrottledRateBytesPerSecond: 1024,
+		ThrottledRateMinDuration:    20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("doGETBytesWithRetry() error = %v", err)
+	}
+	if got := string(body); got != "fragment-ok" {
+		t.Fatalf("body=%q, want fragment-ok", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("call count=%d, want 2", got)
+	}
+}
+
 func TestParseRetryAfter_SecondsAndHTTPDate(t *testing.T) {
 	if d := parseRetryAfter("1"); d != time.Second {
 		t.Fatalf("seconds parse mismatch: got=%v want=%v", d, time.Second)

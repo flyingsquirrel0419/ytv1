@@ -34,7 +34,7 @@ func TestWorkflowMatrix_FixtureCoverage(t *testing.T) {
 			{VideoID: "jNQXAC9IVRw", Title: "one"},
 			{VideoID: "DSYFmhjDbvs", Title: "two"},
 		}
-		summary, failures := runPlaylistItems(context.Background(), nil, items, cli.Options{}, func(_ context.Context, _ *client.Client, videoID string, _ cli.Options) error {
+		summary, failures := runPlaylistItems(context.Background(), nil, items, playlistTemplateContext{}, cli.Options{}, func(_ context.Context, _ *client.Client, videoID string, _ cli.Options) error {
 			if videoID == "DSYFmhjDbvs" {
 				return errors.New("fail")
 			}
@@ -73,7 +73,7 @@ func TestWorkflowMatrix_FixtureCoverage(t *testing.T) {
 		activeDownloadArchive = archive
 		defer func() { activeDownloadArchive = prev }()
 
-		if !shouldSkipDownloadByArchive("https://www.youtube.com/watch?v=jNQXAC9IVRw") {
+		if !shouldSkipDownloadByArchive("https://www.youtube.com/watch?v=jNQXAC9IVRw", cli.Options{}) {
 			t.Fatalf("expected archive skip hit")
 		}
 	})

@@ -115,7 +115,7 @@ func TestGetTranscript(t *testing.T) {
 }
 
 func TestGetPlaylist(t *testing.T) {
-	html := `<html><script>var ytInitialData = {"metadata":{"playlistMetadataRenderer":{"title":"My Playlist"}},"contents":[{"playlistVideoRenderer":{"videoId":"aaaaaaaaaaa","title":{"simpleText":"one"},"shortBylineText":{"runs":[{"text":"author1"}]},"lengthText":{"simpleText":"1:00"}}},{"playlistVideoRenderer":{"videoId":"bbbbbbbbbbb","title":{"runs":[{"text":"two"}]},"shortBylineText":{"runs":[{"text":"author2"}]},"lengthText":{"simpleText":"2:00"}}}]};</script></html>`
+	html := `<html><script>var ytInitialData = {"metadata":{"playlistMetadataRenderer":{"title":"My Playlist"}},"header":{"playlistHeaderRenderer":{"ownerText":{"runs":[{"text":"by Owner Name","navigationEndpoint":{"browseEndpoint":{"browseId":"UC1234567890","canonicalBaseUrl":"/@owner"}}}]}}},"contents":[{"playlistVideoRenderer":{"videoId":"aaaaaaaaaaa","title":{"simpleText":"one"},"shortBylineText":{"runs":[{"text":"author1"}]},"lengthText":{"simpleText":"1:00"}}},{"playlistVideoRenderer":{"videoId":"bbbbbbbbbbb","title":{"runs":[{"text":"two"}]},"shortBylineText":{"runs":[{"text":"author2"}]},"lengthText":{"simpleText":"2:00"}}}]};</script></html>`
 	httpClient := &http.Client{
 		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			if r.Method == http.MethodGet && r.URL.Path == "/playlist" {
@@ -137,6 +137,12 @@ func TestGetPlaylist(t *testing.T) {
 	}
 	if got.Title != "My Playlist" {
 		t.Fatalf("title=%q, want %q", got.Title, "My Playlist")
+	}
+	if got.Channel != "Owner Name" || got.Uploader != "Owner Name" {
+		t.Fatalf("owner name channel=%q uploader=%q, want Owner Name", got.Channel, got.Uploader)
+	}
+	if got.ChannelID != "UC1234567890" || got.UploaderID != "@owner" {
+		t.Fatalf("owner ids channel_id=%q uploader_id=%q, want UC1234567890/@owner", got.ChannelID, got.UploaderID)
 	}
 	if len(got.Items) != 2 {
 		t.Fatalf("items len=%d, want 2", len(got.Items))

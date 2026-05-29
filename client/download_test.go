@@ -81,6 +81,81 @@ func TestDownloadURLToWriter_RetryOnTransientStatus(t *testing.T) {
 	}
 }
 
+func TestDownloadURLToWriter_RetryOnThrottledRate(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < 8; i++ {
+				_, _ = w.Write([]byte("x"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+			return
+		}
+		_, _ = w.Write([]byte("fast-after-throttle"))
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	n, err := downloadURLToWriterWithConfig(context.Background(), srv.Client(), srv.URL, &buf, DownloadTransportConfig{
+		MaxRetries:                  1,
+		InitialBackoff:              time.Millisecond,
+		MaxBackoff:                  time.Millisecond,
+		ThrottledRateBytesPerSecond: 1024,
+		ThrottledRateMinDuration:    20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("downloadURLToWriterWithConfig() error = %v", err)
+	}
+	if n != int64(len("fast-after-throttle")) {
+		t.Fatalf("downloadURLToWriterWithConfig() bytes = %d, want %d", n, len("fast-after-throttle"))
+	}
+	if got := buf.String(); got != "fast-after-throttle" {
+		t.Fatalf("buffer=%q, want retry body without partial throttled bytes", got)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("expected 2 calls, got %d", atomic.LoadInt32(&calls))
+	}
+}
+
+type readSizeRecorder struct {
+	lastLen int
+	done    bool
+}
+
+func (r *readSizeRecorder) Read(p []byte) (int, error) {
+	r.lastLen = len(p)
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	if len(p) == 0 {
+		return 0, nil
+	}
+	p[0] = 'x'
+	return 1, nil
+}
+
+func TestRateLimitedReaderCapsChunkSize(t *testing.T) {
+	src := &readSizeRecorder{}
+	r := rateLimitedReader(context.Background(), src, 20)
+	buf := make([]byte, 100)
+	n, err := r.Read(buf)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("Read() n=%d, want 1", n)
+	}
+	if src.lastLen != 2 {
+		t.Fatalf("underlying read len=%d, want 2", src.lastLen)
+	}
+}
+
 func TestDownloadURLToPath_ResumeAppend(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Range"); got != "bytes=3-" {
@@ -114,6 +189,59 @@ func TestDownloadURLToPath_ResumeAppend(t *testing.T) {
 	}
 	if got := string(body); got != "abcdef" {
 		t.Fatalf("final content=%q, want %q", got, "abcdef")
+	}
+}
+
+func TestDownloadURLToPath_ResumeAppendRetryTruncatesPartialAttempt(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=3-" {
+			t.Fatalf("range header=%q, want %q", got, "bytes=3-")
+		}
+		w.Header().Set("Content-Range", "bytes 3-10/11")
+		w.WriteHeader(http.StatusPartialContent)
+		if atomic.AddInt32(&calls, 1) == 1 {
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < 8; i++ {
+				_, _ = w.Write([]byte("x"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+			return
+		}
+		_, _ = io.WriteString(w, "defghijk")
+	}))
+	defer srv.Close()
+
+	out := filepath.Join(t.TempDir(), "resume-throttle.bin")
+	if err := os.WriteFile(out, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	n, err := downloadURLToPath(context.Background(), srv.Client(), srv.URL, out, true, DownloadTransportConfig{
+		MaxRetries:                  1,
+		InitialBackoff:              time.Millisecond,
+		MaxBackoff:                  time.Millisecond,
+		ThrottledRateBytesPerSecond: 1024,
+		ThrottledRateMinDuration:    20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("downloadURLToPath() error = %v", err)
+	}
+	if n != int64(len("abcdefghijk")) {
+		t.Fatalf("downloadURLToPath() bytes=%d, want %d", n, len("abcdefghijk"))
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if got := string(body); got != "abcdefghijk" {
+		t.Fatalf("final content=%q, want abcdefghijk", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("call count=%d, want 2", got)
 	}
 }
 
@@ -154,6 +282,430 @@ func TestDownloadURLToPath_ResumeFallbackToFull(t *testing.T) {
 	}
 	if got := string(body); got != "full-data" {
 		t.Fatalf("final content=%q, want %q", got, "full-data")
+	}
+}
+
+func TestDownloadURLToPath_FullRewriteRetryTruncatesPartialAttempt(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := strings.TrimSpace(r.Header.Get("Range")); got != "" {
+			t.Fatalf("range header=%q, want empty", got)
+		}
+		if atomic.AddInt32(&calls, 1) == 1 {
+			flusher, _ := w.(http.Flusher)
+			for i := 0; i < 8; i++ {
+				_, _ = w.Write([]byte("x"))
+				if flusher != nil {
+					flusher.Flush()
+				}
+				time.Sleep(15 * time.Millisecond)
+			}
+			return
+		}
+		_, _ = io.WriteString(w, "complete-after-retry")
+	}))
+	defer srv.Close()
+
+	out := filepath.Join(t.TempDir(), "full-rewrite-throttle.bin")
+	n, err := downloadURLToPath(context.Background(), srv.Client(), srv.URL, out, false, DownloadTransportConfig{
+		EnableChunked:               false,
+		MaxRetries:                  1,
+		InitialBackoff:              time.Millisecond,
+		MaxBackoff:                  time.Millisecond,
+		ThrottledRateBytesPerSecond: 1024,
+		ThrottledRateMinDuration:    20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("downloadURLToPath() error = %v", err)
+	}
+	if n != int64(len("complete-after-retry")) {
+		t.Fatalf("downloadURLToPath() bytes=%d, want %d", n, len("complete-after-retry"))
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if got := string(body); got != "complete-after-retry" {
+		t.Fatalf("final content=%q, want complete-after-retry", got)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("call count=%d, want 2", got)
+	}
+}
+
+func TestDownloadURLToPath_PartFileRenamesOnSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "complete")
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "video.bin")
+	n, err := downloadURLToPathWithHeadersAndPart(context.Background(), srv.Client(), srv.URL, out, false, true, DownloadTransportConfig{}, "", nil)
+	if err != nil {
+		t.Fatalf("downloadURLToPathWithHeadersAndPart() error = %v", err)
+	}
+	if n != int64(len("complete")) {
+		t.Fatalf("bytes=%d, want %d", n, len("complete"))
+	}
+	if _, err := os.Stat(out + ".part"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("part file should be renamed away, stat err=%v", err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(body) != "complete" {
+		t.Fatalf("body=%q, want complete", string(body))
+	}
+}
+
+func TestDownloadURLToPath_PartFileRenameRetriesTransientFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "complete-after-rename-retry")
+	}))
+	defer srv.Close()
+
+	previousRenameFile := renameFile
+	var renameCalls int32
+	renameFile = func(oldpath, newpath string) error {
+		if atomic.AddInt32(&renameCalls, 1) == 1 {
+			return &os.PathError{Op: "rename", Path: oldpath, Err: os.ErrPermission}
+		}
+		return previousRenameFile(oldpath, newpath)
+	}
+	defer func() {
+		renameFile = previousRenameFile
+	}()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "video.bin")
+	n, err := downloadURLToPathWithHeadersAndPart(context.Background(), srv.Client(), srv.URL, out, false, true, DownloadTransportConfig{
+		FileAccessRetries: 1,
+		FileAccessBackoff: time.Millisecond,
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("downloadURLToPathWithHeadersAndPart() error = %v", err)
+	}
+	if n != int64(len("complete-after-rename-retry")) {
+		t.Fatalf("bytes=%d, want %d", n, len("complete-after-rename-retry"))
+	}
+	if got := atomic.LoadInt32(&renameCalls); got != 2 {
+		t.Fatalf("rename calls=%d, want 2", got)
+	}
+	if _, err := os.Stat(out + ".part"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("part file should be renamed away, stat err=%v", err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(body) != "complete-after-rename-retry" {
+		t.Fatalf("body=%q, want complete-after-rename-retry", string(body))
+	}
+}
+
+func TestDownloadURLToPath_FileCreateRetriesTransientFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "complete-after-create-retry")
+	}))
+	defer srv.Close()
+
+	previousCreateFile := createFile
+	var createCalls int32
+	createFile = func(name string) (*os.File, error) {
+		if atomic.AddInt32(&createCalls, 1) == 1 {
+			return nil, &os.PathError{Op: "create", Path: name, Err: os.ErrPermission}
+		}
+		return previousCreateFile(name)
+	}
+	defer func() {
+		createFile = previousCreateFile
+	}()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "video.bin")
+	n, err := downloadURLToPath(context.Background(), srv.Client(), srv.URL, out, false, DownloadTransportConfig{
+		FileAccessRetries: 1,
+		FileAccessBackoff: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("downloadURLToPath() error = %v", err)
+	}
+	if n != int64(len("complete-after-create-retry")) {
+		t.Fatalf("bytes=%d, want %d", n, len("complete-after-create-retry"))
+	}
+	if got := atomic.LoadInt32(&createCalls); got != 2 {
+		t.Fatalf("create calls=%d, want 2", got)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(body) != "complete-after-create-retry" {
+		t.Fatalf("body=%q, want complete-after-create-retry", string(body))
+	}
+}
+
+func TestDownloadURLToPath_FileAccessRetriesDefaultToYTDLPValue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "complete-after-default-retries")
+	}))
+	defer srv.Close()
+
+	previousCreateFile := createFile
+	var createCalls int32
+	createFile = func(name string) (*os.File, error) {
+		if atomic.AddInt32(&createCalls, 1) <= 3 {
+			return nil, &os.PathError{Op: "create", Path: name, Err: os.ErrPermission}
+		}
+		return previousCreateFile(name)
+	}
+	defer func() {
+		createFile = previousCreateFile
+	}()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "video.bin")
+	n, err := downloadURLToPath(context.Background(), srv.Client(), srv.URL, out, false, DownloadTransportConfig{
+		FileAccessBackoff: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("downloadURLToPath() error = %v", err)
+	}
+	if n != int64(len("complete-after-default-retries")) {
+		t.Fatalf("bytes=%d, want %d", n, len("complete-after-default-retries"))
+	}
+	if got := atomic.LoadInt32(&createCalls); got != 4 {
+		t.Fatalf("create calls=%d, want 4", got)
+	}
+}
+
+func TestDownloadURLToPath_FileAccessRetriesNegativeDisablesDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "unused")
+	}))
+	defer srv.Close()
+
+	previousCreateFile := createFile
+	var createCalls int32
+	createFile = func(name string) (*os.File, error) {
+		atomic.AddInt32(&createCalls, 1)
+		return nil, &os.PathError{Op: "create", Path: name, Err: os.ErrPermission}
+	}
+	defer func() {
+		createFile = previousCreateFile
+	}()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "video.bin")
+	_, err := downloadURLToPath(context.Background(), srv.Client(), srv.URL, out, false, DownloadTransportConfig{
+		FileAccessRetries: -1,
+		FileAccessBackoff: time.Millisecond,
+	})
+	if err == nil {
+		t.Fatalf("downloadURLToPath() error = nil, want create error")
+	}
+	if got := atomic.LoadInt32(&createCalls); got != 1 {
+		t.Fatalf("create calls=%d, want 1", got)
+	}
+}
+
+func TestCleanupIntermediateFile_RemoveRetriesTransientFailure(t *testing.T) {
+	previousRemoveFile := removeFile
+	var removeCalls int32
+	removeFile = func(name string) error {
+		if atomic.AddInt32(&removeCalls, 1) == 1 {
+			return &os.PathError{Op: "remove", Path: name, Err: os.ErrPermission}
+		}
+		return previousRemoveFile(name)
+	}
+	defer func() {
+		removeFile = previousRemoveFile
+	}()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "intermediate.bin")
+	if err := os.WriteFile(path, []byte("temp"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	c := New(Config{
+		DownloadTransport: DownloadTransportConfig{
+			FileAccessRetries: 1,
+			FileAccessBackoff: time.Millisecond,
+		},
+	})
+	c.cleanupIntermediateFile("video-id", path, false)
+
+	if got := atomic.LoadInt32(&removeCalls); got != 2 {
+		t.Fatalf("remove calls=%d, want 2", got)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("intermediate file should be removed, stat err=%v", err)
+	}
+}
+
+func TestDownloadHLS_PartFileRenameRetriesTransientFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/playlist.m3u8":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = io.WriteString(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nsegment.ts\n#EXT-X-ENDLIST\n")
+		case "/segment.ts":
+			_, _ = io.WriteString(w, "hls-segment")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	previousRenameFile := renameFile
+	var renameCalls int32
+	renameFile = func(oldpath, newpath string) error {
+		if atomic.AddInt32(&renameCalls, 1) == 1 {
+			return &os.PathError{Op: "rename", Path: oldpath, Err: os.ErrPermission}
+		}
+		return previousRenameFile(oldpath, newpath)
+	}
+	defer func() {
+		renameFile = previousRenameFile
+	}()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "hls.ts")
+	c := New(Config{
+		HTTPClient: srv.Client(),
+		DownloadTransport: DownloadTransportConfig{
+			FileAccessRetries: 1,
+			FileAccessBackoff: time.Millisecond,
+		},
+	})
+	result, err := c.downloadHLS(context.Background(), "video-id", srv.URL+"/playlist.m3u8", out, FormatInfo{Itag: 96}, true)
+	if err != nil {
+		t.Fatalf("downloadHLS() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&renameCalls); got != 2 {
+		t.Fatalf("rename calls=%d, want 2", got)
+	}
+	if result.Bytes != int64(len("hls-segment")) {
+		t.Fatalf("result bytes=%d, want %d", result.Bytes, len("hls-segment"))
+	}
+	if _, err := os.Stat(out + ".part"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("part file should be renamed away, stat err=%v", err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(body) != "hls-segment" {
+		t.Fatalf("body=%q, want hls-segment", string(body))
+	}
+}
+
+func TestDownloadDASH_PartFileRenameRetriesTransientFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/manifest.mpd":
+			w.Header().Set("Content-Type", "application/dash+xml")
+			_, _ = io.WriteString(w, `<?xml version="1.0"?>
+<MPD type="static" xmlns="urn:mpeg:dash:schema:mpd:2011">
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="248" bandwidth="1000000">
+        <SegmentTemplate timescale="1" media="seg-$Number$.m4s" startNumber="1">
+          <SegmentTimeline>
+            <S d="1" r="0"/>
+          </SegmentTimeline>
+        </SegmentTemplate>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>`)
+		case "/seg-1.m4s":
+			_, _ = io.WriteString(w, "dash-segment")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	previousRenameFile := renameFile
+	var renameCalls int32
+	renameFile = func(oldpath, newpath string) error {
+		if atomic.AddInt32(&renameCalls, 1) == 1 {
+			return &os.PathError{Op: "rename", Path: oldpath, Err: os.ErrPermission}
+		}
+		return previousRenameFile(oldpath, newpath)
+	}
+	defer func() {
+		renameFile = previousRenameFile
+	}()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "dash.m4s")
+	c := New(Config{
+		HTTPClient: srv.Client(),
+		DownloadTransport: DownloadTransportConfig{
+			FileAccessRetries: 1,
+			FileAccessBackoff: time.Millisecond,
+		},
+	})
+	result, err := c.downloadDASH(context.Background(), "video-id", srv.URL+"/manifest.mpd", out, FormatInfo{Itag: 248}, true)
+	if err != nil {
+		t.Fatalf("downloadDASH() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&renameCalls); got != 2 {
+		t.Fatalf("rename calls=%d, want 2", got)
+	}
+	if result.Bytes != int64(len("dash-segment")) {
+		t.Fatalf("result bytes=%d, want %d", result.Bytes, len("dash-segment"))
+	}
+	if _, err := os.Stat(out + ".part"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("part file should be renamed away, stat err=%v", err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(body) != "dash-segment" {
+		t.Fatalf("body=%q, want dash-segment", string(body))
+	}
+}
+
+func TestDownloadURLToPath_PartFileResume(t *testing.T) {
+	var sawRange bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=3-" {
+			t.Fatalf("range header=%q, want bytes=3-", got)
+		}
+		sawRange = true
+		w.Header().Set("Content-Range", "bytes 3-5/6")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "def")
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "resume.bin")
+	if err := os.WriteFile(out+".part", []byte("abc"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	n, err := downloadURLToPathWithHeadersAndPart(context.Background(), srv.Client(), srv.URL, out, true, true, DownloadTransportConfig{}, "", nil)
+	if err != nil {
+		t.Fatalf("downloadURLToPathWithHeadersAndPart() error = %v", err)
+	}
+	if !sawRange {
+		t.Fatalf("expected resume range request")
+	}
+	if n != 6 {
+		t.Fatalf("bytes=%d, want 6", n)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(body) != "abcdef" {
+		t.Fatalf("body=%q, want abcdef", string(body))
 	}
 }
 
@@ -283,11 +835,16 @@ func TestDownloadURLToPathWithHeaders_AppliesMediaHeaders(t *testing.T) {
 	}
 }
 
-type testMuxer struct{}
+type testMuxer struct {
+	metas *[]types.Metadata
+}
 
 func (testMuxer) Available() bool { return true }
 
-func (testMuxer) Merge(ctx context.Context, videoPath, audioPath, outputPath string, meta types.Metadata) error {
+func (m testMuxer) Merge(ctx context.Context, videoPath, audioPath, outputPath string, meta types.Metadata) error {
+	if m.metas != nil {
+		*m.metas = append(*m.metas, meta)
+	}
 	v, err := os.ReadFile(videoPath)
 	if err != nil {
 		return err
@@ -364,6 +921,101 @@ func TestDownloadAndMerge_DefaultCleansIntermediateFiles(t *testing.T) {
 	}
 	if !hasMergeComplete || !hasCleanupDelete {
 		t.Fatalf("expected merge complete and cleanup delete events, got=%v", events)
+	}
+}
+
+func TestDownloadAndMerge_NoEmbedMetadataSuppressesMergeMetadata(t *testing.T) {
+	videoID := "jNQXAC9IVRw"
+	mediaBase := "https://media.example"
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/youtubei/v1/player"):
+				body := `{
+					"playabilityStatus":{"status":"OK"},
+					"videoDetails":{"videoId":"jNQXAC9IVRw","title":"x","author":"y","shortDescription":"desc","publishDate":"2020-01-02"},
+					"streamingData":{"adaptiveFormats":[
+						{"itag":248,"url":"` + mediaBase + `/v.webm","mimeType":"video/webm","bitrate":1000},
+						{"itag":251,"url":"` + mediaBase + `/a.webm","mimeType":"audio/webm","bitrate":1000}
+					]}
+				}`
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			case r.Method == http.MethodGet && r.URL.Path == "/watch":
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`<html><script src="/s/player/test/base.js"></script></html>`)), Header: make(http.Header)}, nil
+			case r.Method == http.MethodGet && r.URL.String() == mediaBase+"/v.webm":
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("video")), Header: make(http.Header)}, nil
+			case r.Method == http.MethodGet && r.URL.String() == mediaBase+"/a.webm":
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("audio")), Header: make(http.Header)}, nil
+			default:
+				return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header)}, nil
+			}
+		}),
+	}
+
+	var metas []types.Metadata
+	c := New(Config{
+		HTTPClient:      httpClient,
+		ClientOverrides: []string{"mweb"},
+		Muxer:           testMuxer{metas: &metas},
+	})
+	_, err := c.Download(context.Background(), videoID, DownloadOptions{
+		Mode:            SelectionModeBest,
+		OutputPath:      filepath.Join(t.TempDir(), "merged.webm"),
+		NoEmbedMetadata: true,
+	})
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+	if len(metas) != 1 {
+		t.Fatalf("captured metadata count=%d, want 1", len(metas))
+	}
+	if metas[0] != (types.Metadata{}) {
+		t.Fatalf("metadata=%+v, want empty", metas[0])
+	}
+}
+
+func TestDownloadAndMerge_MergeOutputFormat(t *testing.T) {
+	videoID := "jNQXAC9IVRw"
+	mediaBase := "https://media.example"
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch {
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/youtubei/v1/player"):
+				body := `{
+					"playabilityStatus":{"status":"OK"},
+					"videoDetails":{"videoId":"jNQXAC9IVRw","title":"x","author":"y"},
+					"streamingData":{"adaptiveFormats":[
+						{"itag":248,"url":"` + mediaBase + `/v.webm","mimeType":"video/webm","bitrate":1000},
+						{"itag":251,"url":"` + mediaBase + `/a.webm","mimeType":"audio/webm","bitrate":1000}
+					]}
+				}`
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			case r.Method == http.MethodGet && r.URL.Path == "/watch":
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`<html><script src="/s/player/test/base.js"></script></html>`)), Header: make(http.Header)}, nil
+			case r.Method == http.MethodGet && r.URL.String() == mediaBase+"/v.webm":
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("video")), Header: make(http.Header)}, nil
+			case r.Method == http.MethodGet && r.URL.String() == mediaBase+"/a.webm":
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("audio")), Header: make(http.Header)}, nil
+			default:
+				return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header)}, nil
+			}
+		}),
+	}
+
+	c := New(Config{
+		HTTPClient:      httpClient,
+		ClientOverrides: []string{"mweb"},
+		Muxer:           testMuxer{},
+	})
+	res, err := c.Download(context.Background(), videoID, DownloadOptions{
+		Mode:              SelectionModeBest,
+		MergeOutputFormat: "mkv",
+	})
+	if err != nil {
+		t.Fatalf("Download() error = %v", err)
+	}
+	if res.OutputPath != "jNQXAC9IVRw-248+251.mkv" {
+		t.Fatalf("OutputPath=%q, want jNQXAC9IVRw-248+251.mkv", res.OutputPath)
 	}
 }
 

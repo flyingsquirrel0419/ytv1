@@ -48,7 +48,7 @@ func New(config Config) *Client {
 // NewClient creates a new YouTube client.
 func NewClient(config Config) *Client {
 	if config.HTTPClient == nil {
-		config.HTTPClient = defaultHTTPClient(config.ProxyURL)
+		config.HTTPClient = defaultHTTPClient(config.ProxyURL, config.SourceAddress, config.InsecureSkipVerify)
 	}
 	if config.CookieJar != nil {
 		config.HTTPClient.Jar = config.CookieJar
@@ -92,6 +92,14 @@ func NewClient(config Config) *Client {
 	}
 }
 
+// HTTPClient returns the configured HTTP client used for network requests.
+func (c *Client) HTTPClient() *http.Client {
+	if c == nil || c.config.HTTPClient == nil {
+		return nil
+	}
+	return c.config.HTTPClient
+}
+
 // GetVideo fetches video metadata and normalized formats for the input ID/URL.
 func (c *Client) GetVideo(ctx context.Context, input string) (*VideoInfo, error) {
 	ctx, cancel := withDefaultTimeout(ctx, c.config.RequestTimeout)
@@ -113,6 +121,7 @@ func (c *Client) GetVideo(ctx context.Context, input string) (*VideoInfo, error)
 	for _, f := range parsedFormats {
 		outFormats = append(outFormats, toFormatInfo(f))
 	}
+	thumbnail := bestThumbnail(resp)
 
 	info := &VideoInfo{
 		ID:              resp.VideoDetails.VideoID,
@@ -127,6 +136,9 @@ func (c *Client) GetVideo(ctx context.Context, input string) (*VideoInfo, error)
 		Category:        resp.Microformat.PlayerMicroformatRenderer.Category,
 		IsLive:          resp.VideoDetails.IsLiveContent || resp.PlayabilityStatus.IsLive(),
 		Keywords:        append([]string(nil), resp.VideoDetails.Keywords...),
+		ThumbnailURL:    thumbnail.URL,
+		ThumbnailWidth:  thumbnail.Width,
+		ThumbnailHeight: thumbnail.Height,
 		Formats:         outFormats,
 		DashManifestURL: resp.StreamingData.DashManifestURL,
 		HLSManifestURL:  resp.StreamingData.HlsManifestURL,
@@ -837,6 +849,33 @@ func parseInt64String(raw string) int64 {
 		return 0
 	}
 	return v
+}
+
+func bestThumbnail(resp *innertube.PlayerResponse) innertube.Thumbnail {
+	if resp == nil {
+		return innertube.Thumbnail{}
+	}
+	candidates := make([]innertube.Thumbnail, 0,
+		len(resp.VideoDetails.Thumbnail.Thumbnails)+len(resp.Microformat.PlayerMicroformatRenderer.Thumbnail.Thumbnails))
+	candidates = append(candidates, resp.VideoDetails.Thumbnail.Thumbnails...)
+	candidates = append(candidates, resp.Microformat.PlayerMicroformatRenderer.Thumbnail.Thumbnails...)
+	var best innertube.Thumbnail
+	for _, thumb := range candidates {
+		if strings.TrimSpace(thumb.URL) == "" {
+			continue
+		}
+		if best.URL == "" || thumbnailScore(thumb) > thumbnailScore(best) {
+			best = thumb
+		}
+	}
+	return best
+}
+
+func thumbnailScore(thumb innertube.Thumbnail) int {
+	if thumb.Width > 0 && thumb.Height > 0 {
+		return thumb.Width * thumb.Height
+	}
+	return thumb.Width + thumb.Height
 }
 
 func cloneVideoInfo(v *VideoInfo) *VideoInfo {

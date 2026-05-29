@@ -19,6 +19,14 @@ type Config struct {
 	// If HTTPClient is provided, this field is ignored.
 	ProxyURL string
 
+	// SourceAddress is the optional local IP address to bind outbound requests to.
+	// If HTTPClient is provided, this field is ignored.
+	SourceAddress string
+
+	// InsecureSkipVerify disables TLS certificate verification for the default HTTP client.
+	// If HTTPClient is provided, this field is ignored.
+	InsecureSkipVerify bool
+
 	// CookieJar is an optional cookie jar to use for requests.
 	// Applied to HTTPClient if non-nil.
 	CookieJar http.CookieJar
@@ -73,7 +81,8 @@ type Config struct {
 	// RequestHeaders are applied to package-level outgoing HTTP requests.
 	RequestHeaders http.Header
 
-	// RequestTimeout applies a default timeout when incoming context has no deadline.
+	// RequestTimeout applies a package-level timeout to outgoing operations.
+	// If the caller context already has a shorter deadline, that deadline is preserved.
 	// Zero means no additional timeout.
 	RequestTimeout time.Duration
 
@@ -144,15 +153,20 @@ type Muxer interface {
 
 // DownloadTransportConfig controls retry/backoff behavior for direct stream downloads.
 type DownloadTransportConfig struct {
-	MaxRetries               int
-	InitialBackoff           time.Duration
-	MaxBackoff               time.Duration
-	RetryStatusCodes         []int
-	EnableChunked            bool
-	ChunkSize                int64
-	MaxConcurrency           int
-	SkipUnavailableFragments bool
-	MaxSkippedFragments      int
+	MaxRetries                  int
+	InitialBackoff              time.Duration
+	MaxBackoff                  time.Duration
+	RetryStatusCodes            []int
+	EnableChunked               bool
+	ChunkSize                   int64
+	MaxConcurrency              int
+	SkipUnavailableFragments    bool
+	MaxSkippedFragments         int
+	RateLimitBytesPerSecond     int64
+	ThrottledRateBytesPerSecond int64
+	ThrottledRateMinDuration    time.Duration
+	FileAccessRetries           int
+	FileAccessBackoff           time.Duration
 }
 
 // MetadataTransportConfig controls retry/backoff for Innertube player metadata requests.

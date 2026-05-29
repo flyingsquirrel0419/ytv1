@@ -84,8 +84,9 @@ func TestDownload_MP3ModeWithTranscoder(t *testing.T) {
 
 	outPath := filepath.Join(t.TempDir(), "out.mp3")
 	result, err := c.Download(context.Background(), "jNQXAC9IVRw", DownloadOptions{
-		Mode:       SelectionModeMP3,
-		OutputPath: outPath,
+		Mode:         SelectionModeMP3,
+		OutputPath:   outPath,
+		AudioQuality: "192K",
 	})
 	if err != nil {
 		t.Fatalf("Download() error = %v", err)
@@ -95,6 +96,9 @@ func TestDownload_MP3ModeWithTranscoder(t *testing.T) {
 	}
 	if transcoder.meta.VideoID != "jNQXAC9IVRw" || transcoder.meta.SourceItag != 140 || transcoder.meta.SourceMimeType != "audio/mp4" {
 		t.Fatalf("unexpected transcode metadata: %+v", transcoder.meta)
+	}
+	if transcoder.meta.AudioQuality != "192K" {
+		t.Fatalf("AudioQuality=%q, want 192K", transcoder.meta.AudioQuality)
 	}
 	if result.Itag != 140 {
 		t.Fatalf("result itag=%d, want 140", result.Itag)

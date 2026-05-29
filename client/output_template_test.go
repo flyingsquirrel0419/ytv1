@@ -1,77 +1,59 @@
 package client
 
-import (
-	"bytes"
-	"context"
-	"io"
-	"net/http"
-	"path/filepath"
-	"strings"
-	"testing"
-)
+import "testing"
 
-func TestRenderOutputPathTemplate_ReplacesAndSanitizes(t *testing.T) {
-	got := renderOutputPathTemplate(
-		"%(title)s-%(id)s-%(itag)s.%(ext)s",
-		outputTemplateData{
-			VideoID:  "jNQXAC9IVRw",
-			Title:    `A:/B*Title`,
-			Uploader: "jawed",
-			Ext:      "mp4",
-			Itag:     "18",
-		},
-	)
-	if got != "A__B_Title-jNQXAC9IVRw-18.mp4" {
-		t.Fatalf("rendered path = %q", got)
+func TestRenderOutputTemplate_CommonTokens(t *testing.T) {
+	got := RenderOutputTemplate("%(title)s-%(id)s-%(format_id)s-%(vcodec)s.%(ext)s", OutputTemplateData{
+		VideoID:  "abc123",
+		Title:    "bad/name",
+		Itag:     "248",
+		VCodec:   "vp9",
+		Ext:      "webm",
+		FormatID: "248",
+	})
+	want := "bad_name-abc123-248-vp9.webm"
+	if got != want {
+		t.Fatalf("RenderOutputTemplate()=%q, want %q", got, want)
 	}
 }
 
-func TestDownload_UsesOutputTemplateTokens(t *testing.T) {
-	videoID := "jNQXAC9IVRw"
-	mediaBase := "https://media.example"
-	httpClient := &http.Client{
-		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			switch {
-			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/youtubei/v1/player"):
-				body := `{
-					"playabilityStatus":{"status":"OK"},
-					"videoDetails":{"videoId":"jNQXAC9IVRw","title":"A:/B*Title","author":"jawed"},
-					"streamingData":{"formats":[
-						{"itag":18,"url":"` + mediaBase + `/v.mp4","mimeType":"video/mp4","bitrate":1000}
-					]}
-				}`
-				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
-			case r.Method == http.MethodGet && r.URL.Path == "/watch":
-				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`<html><script src="/s/player/test/base.js"></script></html>`)), Header: make(http.Header)}, nil
-			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/s/player/"):
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(bytes.NewBufferString(`var cfg={signatureTimestamp:20494};`)),
-				}, nil
-			case r.Method == http.MethodGet && r.URL.String() == mediaBase+"/v.mp4":
-				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("payload")), Header: make(http.Header)}, nil
-			default:
-				return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found")), Header: make(http.Header)}, nil
-			}
-		}),
-	}
-
-	c := New(Config{
-		HTTPClient:      httpClient,
-		ClientOverrides: []string{"mweb"},
+func TestRenderOutputTemplate_RestrictedFilenames(t *testing.T) {
+	got := RenderOutputTemplate("%(title)s", OutputTemplateData{
+		Title:             "A title with 한글 / symbols!",
+		RestrictFilenames: true,
 	})
-
-	template := filepath.Join(t.TempDir(), "%(title)s-%(id)s-%(itag)s.%(ext)s")
-	res, err := c.Download(context.Background(), videoID, DownloadOptions{
-		Itag:       18,
-		OutputPath: template,
-	})
-	if err != nil {
-		t.Fatalf("Download() error = %v", err)
+	if got != "A_title_with_symbols" {
+		t.Fatalf("RenderOutputTemplate()=%q, want A_title_with_symbols", got)
 	}
-	wantSuffix := "A__B_Title-jNQXAC9IVRw-18.mp4"
-	if filepath.Base(res.OutputPath) != wantSuffix {
-		t.Fatalf("output file = %q, want suffix %q", filepath.Base(res.OutputPath), wantSuffix)
+}
+
+func TestSelectedFormatTemplateTokens(t *testing.T) {
+	tokens := SelectedFormatTemplateTokens([]FormatInfo{
+		{
+			Itag:     248,
+			MimeType: "video/webm; codecs=\"vp9\"",
+			HasVideo: true,
+			Width:    1920,
+			Height:   1080,
+			FPS:      60,
+			Bitrate:  2000000,
+			Protocol: "https",
+		},
+		{
+			Itag:     251,
+			MimeType: "audio/webm; codecs=\"opus\"",
+			HasAudio: true,
+			Bitrate:  128000,
+			Protocol: "https",
+		},
+	})
+	if tokens.Resolution != "1920x1080" || tokens.Width != "1920" || tokens.Height != "1080" || tokens.FPS != "60" {
+		t.Fatalf("video tokens=%+v", tokens)
+	}
+	if tokens.TBR != "2128" || tokens.VBR != "2000" || tokens.ABR != "128" {
+		t.Fatalf("bitrate tokens=%+v", tokens)
+	}
+	if tokens.VCodec != "vp9" || tokens.ACodec != "opus" || tokens.Protocol != "https" {
+		t.Fatalf("codec/protocol tokens=%+v", tokens)
 	}
 }

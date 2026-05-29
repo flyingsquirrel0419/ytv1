@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,7 +21,14 @@ import (
 )
 
 var verboseLifecyclePrinter *lifecyclePrinter
-var activeDownloadArchive *downloadArchive
+var activeDownloadArchive *client.DownloadArchive
+var activeDownloadLimit *downloadLimit
+var sleepBeforeRequestFunc = time.Sleep
+var sleepBeforeDownloadFunc = time.Sleep
+var sleepBeforeSubtitleFunc = time.Sleep
+
+var errBreakOnExisting = errors.New("break on existing archive entry")
+var errMaxDownloadsReached = errors.New("maximum number of downloads reached")
 
 const (
 	exitCodeSuccess             = 0
@@ -69,6 +76,12 @@ func run(opts cli.Options) int {
 			}
 		}()
 	}
+	if opts.MaxDownloads > 0 {
+		activeDownloadLimit = &downloadLimit{Max: opts.MaxDownloads}
+		defer func() {
+			activeDownloadLimit = nil
+		}()
+	}
 	attachLifecycleHandlers(&cfg, opts)
 	c := client.New(cfg)
 	ctx := context.Background()
@@ -105,6 +118,9 @@ func processInputsWithExitCode(
 	exitCode := exitCodeSuccess
 	for _, url := range urls {
 		if err := processor(ctx, c, url, opts); err != nil {
+			if errors.Is(err, errBreakOnExisting) || errors.Is(err, errMaxDownloadsReached) {
+				break
+			}
 			code := classifyExitCode(err)
 			if code > exitCode {
 				exitCode = code
@@ -154,7 +170,10 @@ func processURL(ctx context.Context, c *client.Client, url string, opts cli.Opti
 	if opts.PlayerJSURLOnly {
 		return handlePlayerJS(ctx, c, url)
 	}
-	if shouldSkipDownloadByArchive(url) {
+	if shouldSkipDownloadByArchive(url, opts) {
+		if opts.BreakOnExisting {
+			return errBreakOnExisting
+		}
 		return nil
 	}
 
@@ -162,6 +181,9 @@ func processURL(ctx context.Context, c *client.Client, url string, opts cli.Opti
 	defer cancel()
 
 	extractStart := time.Now()
+	if err := sleepBeforeExtractionRequest(ctx, opts); err != nil {
+		return err
+	}
 	info, err := c.GetVideo(ctx, url)
 	if err != nil {
 		if opts.Verbose {
@@ -185,12 +207,72 @@ func processURL(ctx context.Context, c *client.Client, url string, opts cli.Opti
 	}
 
 	if opts.PrintJSON || opts.DumpSingleJSON {
-		return emitDumpSingleJSON(os.Stdout, url, info)
+		if err := emitDumpSingleJSON(os.Stdout, url, info); err != nil {
+			return err
+		}
+		return recordForcedArchiveIfRequested(info, opts)
 	}
 
 	if opts.ListFormats {
 		printFormats(info)
-		return nil // yt-dlp stops after listing formats
+		return recordForcedArchiveIfRequested(info, opts) // yt-dlp stops after listing formats
+	}
+	if opts.ListSubs {
+		if err := sleepBeforeExtractionRequest(ctx, opts); err != nil {
+			return err
+		}
+		tracks, err := c.GetSubtitleTracks(ctx, url)
+		if err != nil {
+			return err
+		}
+		printSubtitleTracks(info, tracks)
+		return recordForcedArchiveIfRequested(info, opts)
+	}
+	if opts.GetThumbnail {
+		if err := printThumbnailURL(info); err != nil {
+			return err
+		}
+		return recordForcedArchiveIfRequested(info, opts)
+	}
+	if hasMetadataGetFlag(opts) {
+		resolveURL := func(itag int) (string, error) {
+			return c.ResolveStreamURL(ctx, info.ID, itag)
+		}
+		if err := printRequestedMetadata(info, url, opts, resolveURL); err != nil {
+			return err
+		}
+		return recordForcedArchiveIfRequested(info, opts)
+	}
+
+	if opts.WriteInfoJSON {
+		if err := writeInfoJSONSidecar(url, info, opts); err != nil {
+			return err
+		}
+	}
+	if opts.WriteDescription {
+		if err := writeDescriptionSidecar(info, opts); err != nil {
+			return err
+		}
+	}
+	if opts.WriteThumbnail {
+		if err := writeThumbnailSidecar(ctx, c, info, opts); err != nil {
+			return err
+		}
+	}
+	if opts.WriteURLLink {
+		if err := writeShortcutSidecar(url, info, opts, shortcutURL); err != nil {
+			return err
+		}
+	}
+	if opts.WriteWeblocLink {
+		if err := writeShortcutSidecar(url, info, opts, shortcutWebloc); err != nil {
+			return err
+		}
+	}
+	if opts.WriteDesktopLink {
+		if err := writeShortcutSidecar(url, info, opts, shortcutDesktop); err != nil {
+			return err
+		}
 	}
 
 	if opts.WriteSubs || opts.WriteAutoSubs {
@@ -200,16 +282,50 @@ func processURL(ctx context.Context, c *client.Client, url string, opts cli.Opti
 	}
 
 	if opts.SkipDownload {
-		fmt.Printf("Skipping download for %s\n", info.Title)
-		return nil
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Skipping download for %s\n", info.Title)
+		}
+		return recordForcedArchiveIfRequested(info, opts)
 	}
 
-	fmt.Printf("Downloading: %s [%s]\n", info.Title, info.ID)
-	res, err := c.Download(ctx, url, buildDownloadOptions(opts))
+	if shouldPrintProgressText(opts) {
+		fmt.Printf("Downloading: %s [%s]\n", info.Title, info.ID)
+	}
+	downloadOpts, err := buildDownloadOptionsForVideo(info, opts)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Downloaded to: %s\n", res.OutputPath)
+	if shouldSkipExistingOutput(downloadOpts.OutputPath, opts) {
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Skipping existing file: %s\n", downloadOpts.OutputPath)
+		}
+		if err := recordCompletedDownload(info.ID); err != nil {
+			return err
+		}
+		return nil
+	}
+	if shouldSkipExistingPostprocessedOutput(info, downloadOpts.OutputPath, opts) {
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Skipping existing post-processed file: %s\n", downloadOpts.OutputPath)
+		}
+		if err := recordCompletedDownload(info.ID); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := sleepBeforeMediaDownload(ctx, opts); err != nil {
+		return err
+	}
+	res, err := c.Download(ctx, url, downloadOpts)
+	if err != nil {
+		return err
+	}
+	if shouldPrintProgressText(opts) {
+		fmt.Printf("Downloaded to: %s\n", res.OutputPath)
+	}
+	if err := applyDownloadedFileMTime(res.OutputPath, info, opts); err != nil {
+		return err
+	}
 	if opts.Verbose && verboseLifecyclePrinter != nil {
 		timing := verboseLifecyclePrinter.popVideoTiming(info.ID)
 		videoMs := timing.downloadVideoMs
@@ -223,16 +339,18 @@ func processURL(ctx context.Context, c *client.Client, url string, opts cli.Opti
 			bps := int64(float64(res.Bytes) / (float64(downloadTotalMs) / 1000.0))
 			avgSpeed = fmt.Sprintf("%dB/s", bps)
 		}
-		fmt.Printf(
-			"total_elapsed_ms=%d extract_ms=%d download_ms(video/audio)=%d/%d merge_ms=%d final_size=%d avg_speed=%s\n",
-			time.Since(totalStart).Milliseconds(),
-			extractMs,
-			videoMs,
-			audioMs,
-			timing.mergeMs,
-			res.Bytes,
-			avgSpeed,
-		)
+		if shouldPrintHumanText(opts) {
+			fmt.Printf(
+				"total_elapsed_ms=%d extract_ms=%d download_ms(video/audio)=%d/%d merge_ms=%d final_size=%d avg_speed=%s\n",
+				time.Since(totalStart).Milliseconds(),
+				extractMs,
+				videoMs,
+				audioMs,
+				timing.mergeMs,
+				res.Bytes,
+				avgSpeed,
+			)
+		}
 	}
 	if err := recordCompletedDownload(info.ID); err != nil {
 		return err
@@ -240,15 +358,130 @@ func processURL(ctx context.Context, c *client.Client, url string, opts cli.Opti
 	return nil
 }
 
+func shouldSkipExistingOutput(path string, opts cli.Options) bool {
+	if !opts.NoOverwrites || strings.TrimSpace(path) == "" {
+		return false
+	}
+	if _, err := os.Stat(path); err == nil {
+		return true
+	}
+	return false
+}
+
+func shouldSkipExistingPostprocessedOutput(info *client.VideoInfo, path string, opts cli.Options) bool {
+	if !opts.NoPostOverwrites || strings.TrimSpace(path) == "" {
+		return false
+	}
+	if !isPostprocessedOutput(info, opts) {
+		return false
+	}
+	if _, err := os.Stat(path); err == nil {
+		return true
+	}
+	return false
+}
+
+func isPostprocessedOutput(info *client.VideoInfo, opts cli.Options) bool {
+	downloadOpts := buildDownloadOptions(opts)
+	if downloadOpts.Mode == client.SelectionModeMP3 {
+		return true
+	}
+	if info == nil {
+		return false
+	}
+	formats, err := selectedFormatsForOptions(info.Formats, opts)
+	if err != nil {
+		return false
+	}
+	return isMergedSelection(formats)
+}
+
+func sleepBeforeExtractionRequest(ctx context.Context, opts cli.Options) error {
+	if opts.SleepRequests <= 0 {
+		return nil
+	}
+	return sleepWithContext(ctx, opts.SleepRequests, sleepBeforeRequestFunc)
+}
+
+func sleepBeforeMediaDownload(ctx context.Context, opts cli.Options) error {
+	d := mediaDownloadSleepDuration(opts)
+	if d <= 0 {
+		return nil
+	}
+	return sleepWithContext(ctx, d, sleepBeforeDownloadFunc)
+}
+
+func mediaDownloadSleepDuration(opts cli.Options) time.Duration {
+	minSleep := opts.SleepInterval
+	if minSleep <= 0 {
+		return 0
+	}
+	if opts.MaxSleepInterval > minSleep {
+		return minSleep
+	}
+	return minSleep
+}
+
+func sleepBeforeSubtitleDownload(ctx context.Context, opts cli.Options) error {
+	if opts.SleepSubtitles <= 0 {
+		return nil
+	}
+	return sleepWithContext(ctx, opts.SleepSubtitles, sleepBeforeSubtitleFunc)
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration, sleepFn func(time.Duration)) error {
+	if d <= 0 {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		sleepFn(d)
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
+}
+
+func applyDownloadedFileMTime(path string, info *client.VideoInfo, opts cli.Options) error {
+	if !opts.UpdateMTime || strings.TrimSpace(path) == "" {
+		return nil
+	}
+	mt, ok := client.MediaFileMTime(info)
+	if !ok {
+		return nil
+	}
+	if err := os.Chtimes(path, mt, mt); err != nil {
+		return fmt.Errorf("failed to update media mtime: %w", err)
+	}
+	return nil
+}
+
 func buildDownloadOptions(opts cli.Options) client.DownloadOptions {
 	downloadOpts := client.DownloadOptions{
-		Mode:        client.SelectionModeBest,
-		OutputPath:  opts.OutputTemplate, // Client handles templating slightly different, usually expects strict path or ""
-		MergeOutput: true,                // Always try to merge on 'best'
-		Resume:      !opts.NoContinue,
+		Mode:                  client.SelectionModeBest,
+		OutputPath:            effectiveOutputTemplate(opts),
+		MergeOutput:           true, // Always try to merge on 'best'
+		KeepIntermediateFiles: opts.KeepVideo,
+		Resume:                !opts.NoContinue,
+		UsePartFiles:          !opts.NoPart,
+		AudioQuality:          strings.TrimSpace(opts.AudioQuality),
+		NoEmbedMetadata:       !opts.EmbedMetadata,
+		MergeOutputFormat:     effectiveCLIMergeOutputExt(opts),
 	}
 
 	raw := strings.TrimSpace(opts.FormatSelector)
+	if opts.ExtractAudio && (raw == "" || strings.EqualFold(raw, "best")) {
+		switch strings.ToLower(strings.TrimSpace(opts.AudioFormat)) {
+		case "mp3":
+			raw = "mp3"
+		default:
+			raw = "bestaudio"
+		}
+	}
 	lower := strings.ToLower(raw)
 	switch lower {
 	case "", "best":
@@ -279,9 +512,43 @@ func buildDownloadOptions(opts cli.Options) client.DownloadOptions {
 	return downloadOpts
 }
 
+func buildDownloadOptionsForVideo(info *client.VideoInfo, opts cli.Options) (client.DownloadOptions, error) {
+	downloadOpts := buildDownloadOptions(opts)
+	if info == nil {
+		return downloadOpts, nil
+	}
+	outputPath, err := predictedOutputFilename(info, opts)
+	if err != nil {
+		return client.DownloadOptions{}, err
+	}
+	downloadOpts.OutputPath = outputPath
+	return downloadOpts, nil
+}
+
+func effectiveOutputTemplate(opts cli.Options) string {
+	outputTemplate := strings.TrimSpace(opts.OutputTemplate)
+	if opts.OutputUseID {
+		outputTemplate = "%(id)s.%(ext)s"
+	}
+	outputDir := strings.TrimSpace(opts.OutputPathDir)
+	if outputDir == "" {
+		return outputTemplate
+	}
+	if outputTemplate == "" {
+		return filepath.Join(outputDir, "%(id)s-%(itag)s.%(ext)s")
+	}
+	if filepath.IsAbs(outputTemplate) {
+		return outputTemplate
+	}
+	return filepath.Join(outputDir, outputTemplate)
+}
+
 func processPlaylist(ctx context.Context, c *client.Client, playlistID string, opts cli.Options) error {
 	if shouldPrintPlaylistText(opts) {
 		fmt.Printf("Fetching playlist: %s\n", playlistID)
+	}
+	if err := sleepBeforeExtractionRequest(ctx, opts); err != nil {
+		return err
 	}
 	playlist, err := c.GetPlaylist(ctx, playlistID)
 	if err != nil {
@@ -290,17 +557,38 @@ func processPlaylist(ctx context.Context, c *client.Client, playlistID string, o
 	if shouldPrintPlaylistText(opts) {
 		fmt.Printf("Playlist: %s (%d videos)\n", playlist.Title, len(playlist.Items))
 	}
+	if opts.WriteInfoJSON && !opts.NoWritePlaylistMetafiles {
+		if err := writePlaylistInfoJSONSidecar(playlist, opts); err != nil {
+			return err
+		}
+	}
+	itemsWithIndex := withPlaylistIndexes(playlist.Items)
+	items, err := client.SelectPlaylistItems(itemsWithIndex, playlistSelector(opts))
+	if err != nil {
+		return err
+	}
+	items = orderPlaylistItems(items, opts)
 	if opts.FlatPlaylist {
-		return emitFlatPlaylist(playlist.Items, opts, os.Stdout)
+		return emitFlatPlaylist(items, opts, os.Stdout)
 	}
 
-	summary, failures := runPlaylistItems(ctx, c, playlist.Items, opts, processURL)
+	playlistCtx := playlistTemplateContext{
+		ID:         playlist.ID,
+		Title:      playlist.Title,
+		Uploader:   playlist.Uploader,
+		UploaderID: playlist.UploaderID,
+		Channel:    playlist.Channel,
+		ChannelID:  playlist.ChannelID,
+		Count:      len(items),
+	}
+	summary, failures := runPlaylistItems(ctx, c, items, playlistCtx, opts, processURL)
 	if shouldPrintPlaylistText(opts) {
 		fmt.Printf(
-			"Playlist summary: total=%d succeeded=%d failed=%d aborted=%t\n",
+			"Playlist summary: total=%d succeeded=%d failed=%d skipped=%d aborted=%t\n",
 			summary.Total,
 			summary.Succeeded,
 			summary.Failed,
+			summary.Skipped,
 			summary.Aborted,
 		)
 	}
@@ -315,8 +603,58 @@ func processPlaylist(ctx context.Context, c *client.Client, playlistID string, o
 	return nil
 }
 
+func playlistSelector(opts cli.Options) string {
+	if strings.TrimSpace(opts.PlaylistItems) != "" {
+		return opts.PlaylistItems
+	}
+	if opts.PlaylistStart <= 0 && opts.PlaylistEnd <= 0 {
+		return ""
+	}
+	start := ""
+	end := ""
+	if opts.PlaylistStart > 0 {
+		start = strconv.Itoa(opts.PlaylistStart)
+	}
+	if opts.PlaylistEnd > 0 {
+		end = strconv.Itoa(opts.PlaylistEnd)
+	}
+	return start + ":" + end
+}
+
+func orderPlaylistItems(items []client.PlaylistItem, opts cli.Options) []client.PlaylistItem {
+	if opts.PlaylistReverse {
+		return client.OrderPlaylistItems(items, client.PlaylistOrderReverse)
+	}
+	if opts.PlaylistRandom {
+		return client.OrderPlaylistItems(items, client.PlaylistOrderRandom)
+	}
+	return items
+}
+
+func reversePlaylistItems(items []client.PlaylistItem) []client.PlaylistItem {
+	return client.ReversePlaylistItems(items)
+}
+
+func shufflePlaylistItems(items []client.PlaylistItem, rng *rand.Rand) []client.PlaylistItem {
+	return client.ShufflePlaylistItems(items, rng)
+}
+
 func shouldPrintPlaylistText(opts cli.Options) bool {
-	return !opts.PrintJSON && !opts.DumpSingleJSON
+	return shouldPrintHumanText(opts)
+}
+
+func shouldPrintHumanText(opts cli.Options) bool {
+	return !opts.PrintJSON && !opts.DumpSingleJSON && !opts.Quiet
+}
+
+func shouldPrintProgressText(opts cli.Options) bool {
+	if opts.PrintJSON || opts.DumpSingleJSON {
+		return false
+	}
+	if opts.NoProgress {
+		return false
+	}
+	return opts.Progress || !opts.Quiet
 }
 
 func emitFlatPlaylist(items []client.PlaylistItem, opts cli.Options, w io.Writer) error {
@@ -348,6 +686,7 @@ type playlistRunSummary struct {
 	Succeeded int
 	Failed    int
 	Aborted   bool
+	Skipped   int
 }
 
 type playlistItemFailure struct {
@@ -355,25 +694,51 @@ type playlistItemFailure struct {
 	Err     error
 }
 
+type playlistTemplateContext struct {
+	ID         string
+	Title      string
+	Uploader   string
+	UploaderID string
+	Channel    string
+	ChannelID  string
+	Count      int
+}
+
 func runPlaylistItems(
 	ctx context.Context,
 	c *client.Client,
 	items []client.PlaylistItem,
+	playlistCtx playlistTemplateContext,
 	opts cli.Options,
 	processor func(context.Context, *client.Client, string, cli.Options) error,
 ) (playlistRunSummary, []playlistItemFailure) {
 	summary := playlistRunSummary{Total: len(items)}
 	failures := make([]playlistItemFailure, 0)
 	for i, item := range items {
-		fmt.Printf("[%d/%d] Processing %s (%s)...\n", i+1, len(items), item.Title, item.VideoID)
-		if err := processor(ctx, c, item.VideoID, opts); err != nil {
+		if shouldPrintProgressText(opts) {
+			fmt.Printf("[%d/%d] Processing %s (%s)...\n", i+1, len(items), item.Title, item.VideoID)
+		}
+		itemOpts := applyPlaylistTemplateContext(opts, item, i+1, playlistCtx)
+		if err := processor(ctx, c, item.VideoID, itemOpts); err != nil {
+			if errors.Is(err, errBreakOnExisting) {
+				summary.Aborted = true
+				summary.Skipped = len(items) - i - 1
+				break
+			}
+			if errors.Is(err, errMaxDownloadsReached) {
+				summary.Succeeded++
+				summary.Aborted = true
+				summary.Skipped = len(items) - i - 1
+				break
+			}
 			summary.Failed++
 			failures = append(failures, playlistItemFailure{
 				VideoID: item.VideoID,
 				Err:     err,
 			})
-			if opts.AbortOnError {
+			if opts.AbortOnError || reachedPlaylistFailureThreshold(summary.Failed, opts.SkipPlaylistAfterErrors) {
 				summary.Aborted = true
+				summary.Skipped = len(items) - i - 1
 				break
 			}
 			continue
@@ -383,36 +748,478 @@ func runPlaylistItems(
 	return summary, failures
 }
 
+func withPlaylistIndexes(items []client.PlaylistItem) []client.PlaylistItem {
+	out := append([]client.PlaylistItem(nil), items...)
+	for i := range out {
+		if out[i].PlaylistIndex <= 0 {
+			out[i].PlaylistIndex = i + 1
+		}
+	}
+	return out
+}
+
+func applyPlaylistTemplateContext(opts cli.Options, item client.PlaylistItem, autonumber int, playlistCtx playlistTemplateContext) cli.Options {
+	if strings.TrimSpace(opts.OutputTemplate) == "" {
+		return opts
+	}
+	index := item.PlaylistIndex
+	if index <= 0 {
+		index = autonumber
+	}
+	replacements := map[string]string{
+		"%(playlist_index)s":       fmt.Sprintf("%05d", index),
+		"%(playlist_autonumber)s":  fmt.Sprintf("%05d", autonumber),
+		"%(playlist_count)s":       fmt.Sprintf("%05d", playlistCtx.Count),
+		"%(playlist_id)s":          sanitizeTemplateToken(playlistCtx.ID),
+		"%(playlist_title)s":       sanitizeTemplateToken(playlistCtx.Title),
+		"%(playlist_uploader)s":    sanitizeTemplateToken(playlistCtx.Uploader),
+		"%(playlist_uploader_id)s": sanitizeTemplateToken(playlistCtx.UploaderID),
+		"%(playlist_channel)s":     sanitizeTemplateToken(playlistCtx.Channel),
+		"%(playlist_channel_id)s":  sanitizeTemplateToken(playlistCtx.ChannelID),
+	}
+	for token, value := range replacements {
+		opts.OutputTemplate = strings.ReplaceAll(opts.OutputTemplate, token, value)
+	}
+	return opts
+}
+
+func reachedPlaylistFailureThreshold(failures int, threshold int) bool {
+	return threshold > 0 && failures >= threshold
+}
+
 func printFormats(info *client.VideoInfo) {
 	fmt.Printf("Title: %s\n", info.Title)
 	fmt.Println("ID | Ext | Resolution | FPS | Bitrate | Proto | Codec | Note")
 	fmt.Println("---|-----|------------|-----|---------|-------|-------|------")
 	for _, f := range info.Formats {
 		fmt.Printf("%3d|%4s|%4dx%-4d|%3d|%6dk|%5s|%s|%s\n",
-			f.Itag, mimeExt(f.MimeType), f.Width, f.Height, f.FPS, f.Bitrate/1000, f.Protocol, f.MimeType, formatTrackNote(f))
+			f.Itag, client.FormatMediaExt(f.MimeType), f.Width, f.Height, f.FPS, f.Bitrate/1000, f.Protocol, f.MimeType, client.FormatTrackNote(f))
 	}
 }
 
-func formatTrackNote(f client.FormatInfo) string {
-	switch {
-	case f.HasAudio && !f.HasVideo:
-		return "audio only"
-	case f.HasVideo && !f.HasAudio:
-		return "video only"
-	case f.HasAudio && f.HasVideo:
-		return "av"
-	default:
+func printSubtitleTracks(info *client.VideoInfo, tracks []client.SubtitleTrack) {
+	fmt.Printf("Available subtitles for %s [%s]\n", info.Title, info.ID)
+	fmt.Println("Lang | Name | Ext | Type")
+	fmt.Println("-----|------|-----|-----")
+	for _, track := range tracks {
+		kind := "manual"
+		if track.AutoGenerated {
+			kind = "auto"
+		}
+		ext := track.Ext
+		if strings.TrimSpace(ext) == "" {
+			ext = "vtt"
+		}
+		fmt.Printf("%s|%s|%s|%s\n", track.LanguageCode, track.Name, ext, kind)
+	}
+}
+
+func printThumbnailURL(info *client.VideoInfo) error {
+	if info == nil || strings.TrimSpace(info.ThumbnailURL) == "" {
+		videoID := ""
+		if info != nil {
+			videoID = info.ID
+		}
+		return fmt.Errorf("%w: thumbnail unavailable for video=%s", client.ErrUnavailable, videoID)
+	}
+	fmt.Println(info.ThumbnailURL)
+	return nil
+}
+
+func hasMetadataGetFlag(opts cli.Options) bool {
+	return opts.GetTitle || opts.GetID || opts.GetDescription || opts.GetDuration || opts.GetFormat || opts.GetFilename || opts.GetURL || len(opts.PrintTemplates) > 0 || len(opts.PrintToFile) > 0 || len(opts.GetMetadataOrder) > 0
+}
+
+type streamURLResolver func(itag int) (string, error)
+
+func printRequestedMetadata(info *client.VideoInfo, input string, opts cli.Options, resolveURL streamURLResolver) error {
+	order := opts.GetMetadataOrder
+	if len(order) == 0 {
+		if opts.GetTitle {
+			order = append(order, "title")
+		}
+		if opts.GetID {
+			order = append(order, "id")
+		}
+		if opts.GetDescription {
+			order = append(order, "description")
+		}
+		if opts.GetDuration {
+			order = append(order, "duration")
+		}
+		if opts.GetFilename {
+			order = append(order, "filename")
+		}
+		if opts.GetFormat {
+			order = append(order, "format")
+		}
+		if opts.GetURL {
+			order = append(order, "url")
+		}
+		for _, template := range opts.PrintTemplates {
+			order = append(order, "print:"+template)
+		}
+		for _, spec := range opts.PrintToFile {
+			order = append(order, "printfile:"+spec.Template+"\x00"+spec.File)
+		}
+	}
+	for _, field := range order {
+		switch field {
+		case "title":
+			fmt.Println(info.Title)
+		case "id":
+			fmt.Println(info.ID)
+		case "description":
+			fmt.Println(info.Description)
+		case "duration":
+			fmt.Println(client.FormatDuration(info.DurationSec))
+		case "filename":
+			filename, err := predictedOutputFilename(info, opts)
+			if err != nil {
+				return err
+			}
+			fmt.Println(filename)
+		case "format":
+			formats, err := selectedFormatsForOptions(info.Formats, opts)
+			if err != nil {
+				return err
+			}
+			fmt.Println(formatSelectedFormats(formats))
+		case "url":
+			urls, err := selectedStreamURLs(info, opts, resolveURL)
+			if err != nil {
+				return err
+			}
+			for _, url := range urls {
+				fmt.Println(url)
+			}
+		default:
+			if strings.HasPrefix(field, "print:") {
+				line, err := renderPrintTemplate(strings.TrimPrefix(field, "print:"), info, input, opts, resolveURL)
+				if err != nil {
+					return err
+				}
+				fmt.Println(line)
+			} else if strings.HasPrefix(field, "printfile:") {
+				spec, ok := parsePrintFileOrderField(strings.TrimPrefix(field, "printfile:"))
+				if !ok {
+					continue
+				}
+				if err := appendPrintToFile(spec, info, input, opts, resolveURL); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func parsePrintFileOrderField(raw string) (cli.PrintToFileSpec, bool) {
+	parts := strings.SplitN(raw, "\x00", 2)
+	if len(parts) != 2 {
+		return cli.PrintToFileSpec{}, false
+	}
+	return cli.PrintToFileSpec{Template: parts[0], File: parts[1]}, true
+}
+
+func appendPrintToFile(spec cli.PrintToFileSpec, info *client.VideoInfo, input string, opts cli.Options, resolveURL streamURLResolver) error {
+	line, err := renderPrintTemplate(spec.Template, info, input, opts, resolveURL)
+	if err != nil {
+		return err
+	}
+	path := strings.TrimSpace(spec.File)
+	if path == "" {
+		return fmt.Errorf("%w: empty --print-to-file path", client.ErrInvalidInput)
+	}
+	path = renderCLITemplate(path, cliTemplateData{
+		VideoID:           info.ID,
+		Title:             info.Title,
+		Uploader:          info.Author,
+		UploaderID:        cliTemplateUploaderID(info),
+		Channel:           info.Author,
+		ChannelID:         info.ChannelID,
+		Ext:               "txt",
+		Itag:              "print",
+		FormatID:          "print",
+		UploadDate:        cliTemplateUploadDate(info),
+		ReleaseDate:       cliTemplateReleaseDate(info),
+		Timestamp:         cliTemplateTimestamp(info),
+		RestrictFilenames: opts.RestrictFilenames,
+	})
+	dir := filepath.Dir(path)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create print-to-file directory: %w", err)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open print-to-file output: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return fmt.Errorf("failed to write print-to-file output: %w", err)
+	}
+	return nil
+}
+
+func renderPrintTemplate(template string, info *client.VideoInfo, input string, opts cli.Options, resolveURL streamURLResolver) (string, error) {
+	template = strings.TrimSpace(client.StripPrintStagePrefix(template))
+	filename, err := predictedOutputFilename(info, opts)
+	if err != nil && (template == "filename" || strings.Contains(template, "%(filename)s")) {
+		return "", err
+	}
+	formatSummary := ""
+	if strings.Contains(template, "%(format)s") {
+		formats, err := selectedFormatsForOptions(info.Formats, opts)
+		if err != nil {
+			return "", err
+		}
+		formatSummary = formatSelectedFormats(formats)
+	}
+	streamURL := ""
+	if strings.Contains(template, "%(url)s") {
+		urls, err := selectedStreamURLs(info, opts, resolveURL)
+		if err != nil {
+			return "", err
+		}
+		streamURL = strings.Join(urls, "\n")
+	}
+	switch template {
+	case "filename":
+		return filename, nil
+	case "format":
+		return formatSummaryForPrint(info, opts)
+	case "url":
+		urls, err := selectedStreamURLs(info, opts, resolveURL)
+		if err != nil {
+			return "", err
+		}
+		return strings.Join(urls, "\n"), nil
+	}
+	formats, err := selectedFormatsForOptions(info.Formats, opts)
+	ext := ""
+	itag := ""
+	formatTokens := client.FormatTemplateTokens{}
+	if err == nil && len(formats) > 0 {
+		if isMergedSelection(formats) {
+			videoItag, audioItag := mergedItags(formats)
+			ext = effectiveCLIMergeOutputExt(opts)
+			itag = fmt.Sprintf("%d+%d", videoItag, audioItag)
+		} else {
+			ext = detectCLIOutputExt(formats[0].MimeType, buildDownloadOptions(opts).Mode)
+			itag = strconv.Itoa(formats[0].Itag)
+		}
+		formatTokens = selectedFormatTemplateTokens(formats)
+	}
+	return client.RenderMetadataPrintTemplate(template, client.MetadataPrintData{
+		Info:          info,
+		Input:         input,
+		Filename:      filename,
+		FormatSummary: formatSummary,
+		URL:           streamURL,
+		ThumbnailURL:  info.ThumbnailURL,
+		Description:   info.Description,
+		Duration:      client.FormatDuration(info.DurationSec),
+		UploadDate:    cliTemplateUploadDate(info),
+		ReleaseDate:   cliTemplateReleaseDate(info),
+		Timestamp:     cliTemplateTimestamp(info),
+		OutputTemplate: client.OutputTemplateData{
+			VideoID:           info.ID,
+			Title:             info.Title,
+			Uploader:          info.Author,
+			UploaderID:        cliTemplateUploaderID(info),
+			Channel:           info.Author,
+			ChannelID:         info.ChannelID,
+			Ext:               ext,
+			Itag:              itag,
+			FormatID:          itag,
+			Resolution:        formatTokens.Resolution,
+			Width:             formatTokens.Width,
+			Height:            formatTokens.Height,
+			FPS:               formatTokens.FPS,
+			TBR:               formatTokens.TBR,
+			VBR:               formatTokens.VBR,
+			ABR:               formatTokens.ABR,
+			Protocol:          formatTokens.Protocol,
+			VCodec:            formatTokens.VCodec,
+			ACodec:            formatTokens.ACodec,
+			UploadDate:        cliTemplateUploadDate(info),
+			ReleaseDate:       cliTemplateReleaseDate(info),
+			Timestamp:         cliTemplateTimestamp(info),
+			RestrictFilenames: opts.RestrictFilenames,
+		},
+	})
+}
+
+func formatSummaryForPrint(info *client.VideoInfo, opts cli.Options) (string, error) {
+	formats, err := selectedFormatsForOptions(info.Formats, opts)
+	if err != nil {
+		return "", err
+	}
+	return formatSelectedFormats(formats), nil
+}
+
+func normalizedCLIMergeOutputExt(raw string) string {
+	return client.NormalizeMergeOutputExt(raw)
+}
+
+func effectiveCLIMergeOutputExt(opts cli.Options) string {
+	if strings.TrimSpace(opts.MergeOutputFormat) != "" {
+		return normalizedCLIMergeOutputExt(opts.MergeOutputFormat)
+	}
+	return normalizedCLIMergeOutputExt(remuxVideoTargetExt(opts.RemuxVideo))
+}
+
+func remuxVideoTargetExt(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return ""
 	}
+	parts := strings.Split(raw, "/")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if i := strings.LastIndex(part, ">"); i >= 0 {
+			part = strings.TrimSpace(part[i+1:])
+		}
+		if part != "" {
+			return part
+		}
+	}
+	return raw
 }
 
-func mimeExt(mimeType string) string {
-	parts := strings.Split(mimeType, "/")
-	if len(parts) < 2 {
-		return "?"
+func predictedOutputFilename(info *client.VideoInfo, opts cli.Options) (string, error) {
+	formats, err := selectedFormatsForOptions(info.Formats, opts)
+	if err != nil {
+		return "", err
 	}
-	sub := strings.Split(parts[1], ";")[0]
-	return sub
+	downloadOpts := buildDownloadOptions(opts)
+	return client.PredictOutputFilename(info, formats, client.OutputFilenameOptions{
+		OutputTemplate:    downloadOpts.OutputPath,
+		Mode:              downloadOpts.Mode,
+		MergeOutputExt:    effectiveCLIMergeOutputExt(opts),
+		TrimFilenames:     opts.TrimFilenames,
+		RestrictFilenames: opts.RestrictFilenames,
+	})
+}
+
+func selectedStreamURLs(info *client.VideoInfo, opts cli.Options, resolveURL streamURLResolver) ([]string, error) {
+	formats, err := selectedFormatsForOptions(info.Formats, opts)
+	if err != nil {
+		return nil, err
+	}
+	urls := make([]string, 0, len(formats))
+	for _, format := range formats {
+		if strings.TrimSpace(format.URL) != "" && !format.Ciphered {
+			urls = append(urls, format.URL)
+			continue
+		}
+		if resolveURL == nil {
+			return nil, fmt.Errorf("%w: direct URL unavailable for itag=%d", client.ErrUnavailable, format.Itag)
+		}
+		resolved, err := resolveURL(format.Itag)
+		if err != nil {
+			return nil, fmt.Errorf("resolve stream URL for itag=%d: %w", format.Itag, err)
+		}
+		if strings.TrimSpace(resolved) == "" {
+			return nil, fmt.Errorf("%w: empty stream URL for itag=%d", client.ErrUnavailable, format.Itag)
+		}
+		urls = append(urls, resolved)
+	}
+	return urls, nil
+}
+
+func isMergedSelection(formats []client.FormatInfo) bool {
+	return client.IsMergedSelection(formats)
+}
+
+func mergedItags(formats []client.FormatInfo) (int, int) {
+	return client.MergedItags(formats)
+}
+
+type cliTemplateData = client.OutputTemplateData
+
+func renderCLITemplate(template string, data cliTemplateData) string {
+	return client.RenderOutputTemplate(template, data)
+}
+
+func selectedFormatTemplateTokens(formats []client.FormatInfo) client.FormatTemplateTokens {
+	return client.SelectedFormatTemplateTokens(formats)
+}
+
+func cliTemplateUploaderID(info *client.VideoInfo) string {
+	if info == nil {
+		return ""
+	}
+	return info.ChannelID
+}
+
+func cliTemplateUploadDate(info *client.VideoInfo) string {
+	if info == nil {
+		return ""
+	}
+	return compactDateToken(firstNonEmpty(info.UploadDate, info.PublishDate))
+}
+
+func cliTemplateReleaseDate(info *client.VideoInfo) string {
+	if info == nil {
+		return ""
+	}
+	return compactDateToken(firstNonEmpty(info.PublishDate, info.UploadDate))
+}
+
+func cliTemplateTimestamp(info *client.VideoInfo) string {
+	if info == nil {
+		return ""
+	}
+	date := compactDateToken(firstNonEmpty(info.UploadDate, info.PublishDate))
+	if len(date) != 8 {
+		return ""
+	}
+	return date + "000000"
+}
+
+func compactDateToken(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range raw {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func defaultCLIOutputPath(videoID string, itag int, mimeType string, mode client.SelectionMode) string {
+	return client.DefaultOutputPath(videoID, itag, mimeType, mode)
+}
+
+func detectCLIOutputExt(mimeType string, mode client.SelectionMode) string {
+	return client.DetectOutputExt(mimeType, mode)
+}
+
+func selectedFormatsForOptions(formats []client.FormatInfo, opts cli.Options) ([]client.FormatInfo, error) {
+	return client.SelectFormatsForDownloadOptions(formats, buildDownloadOptions(opts))
+}
+
+func formatSelectedFormats(formats []client.FormatInfo) string {
+	return client.FormatSummaries(formats)
 }
 
 func handlePlayerJS(ctx context.Context, c *client.Client, videoID string) error {
@@ -438,6 +1245,18 @@ func writeRequestedSubtitles(
 ) error {
 	subFormat := client.ResolveSubtitleOutputFormat(opts.SubFormat)
 	langs := parseSubtitleLanguages(opts.SubLangs)
+	if opts.AllSubs || subtitleLanguagesRequestAll(langs) {
+		if err := sleepBeforeExtractionRequest(ctx, opts); err != nil {
+			return err
+		}
+		tracks, err := c.GetSubtitleTracks(ctx, input)
+		if err != nil {
+			return err
+		}
+		langs = subtitleLanguagesFromTracksForRequest(tracks, opts, langs)
+	} else {
+		langs = applySubtitleLanguageExclusions(langs)
+	}
 	if len(langs) == 0 {
 		langs = []string{"en"}
 	}
@@ -445,18 +1264,29 @@ func writeRequestedSubtitles(
 	written := 0
 	failures := make([]string, 0, len(langs))
 	for _, lang := range langs {
+		if err := sleepBeforeSubtitleDownload(ctx, opts); err != nil {
+			return err
+		}
 		transcript, err := c.GetTranscript(ctx, input, lang)
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s(%v)", lang, err))
 			continue
 		}
-		outputPath := subtitleOutputPath(opts.OutputTemplate, info, transcript.LanguageCode, string(subFormat))
+		outputPath := subtitleOutputPath(effectiveOutputTemplate(opts), info, transcript.LanguageCode, string(subFormat), opts.RestrictFilenames, opts.TrimFilenames)
+		if shouldSkipExistingOutput(outputPath, opts) {
+			if shouldPrintHumanText(opts) {
+				fmt.Printf("Skipping existing subtitle: %s\n", outputPath)
+			}
+			continue
+		}
 		if err := client.WriteTranscript(outputPath, transcript, subFormat); err != nil {
 			failures = append(failures, fmt.Sprintf("%s(%v)", transcript.LanguageCode, err))
 			continue
 		}
 		written++
-		fmt.Printf("Written subtitle: %s\n", outputPath)
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Written subtitle: %s\n", outputPath)
+		}
 	}
 
 	if written == 0 && len(failures) > 0 {
@@ -469,83 +1299,254 @@ func writeRequestedSubtitles(
 }
 
 func warnf(opts cli.Options, format string, args ...any) {
-	if opts.NoWarnings {
+	if opts.NoWarnings || opts.Quiet {
 		return
 	}
 	log.Printf("WARNING: "+format, args...)
 }
 
 func parseSubtitleLanguages(raw string) []string {
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	seen := make(map[string]struct{}, len(parts))
-	for _, part := range parts {
-		lang := strings.ToLower(strings.TrimSpace(part))
-		if lang == "" {
-			continue
-		}
-		if _, ok := seen[lang]; ok {
-			continue
-		}
-		seen[lang] = struct{}{}
-		out = append(out, lang)
-	}
-	return out
+	return client.ParseSubtitleLanguages(raw)
 }
 
-func subtitleOutputPath(outputTemplate string, info *client.VideoInfo, lang string, outputExt string) string {
-	outputExt = strings.TrimSpace(strings.ToLower(outputExt))
-	if outputExt == "" {
-		outputExt = string(client.SubtitleOutputFormatSRT)
+func subtitleLanguagesRequestAll(langs []string) bool {
+	return client.SubtitleLanguagesRequestAll(langs)
+}
+
+func applySubtitleLanguageExclusions(langs []string) []string {
+	return client.ApplySubtitleLanguageExclusions(langs)
+}
+
+func subtitleLanguagesFromTracksForRequest(tracks []client.SubtitleTrack, opts cli.Options, requested []string) []string {
+	return client.SubtitleLanguagesFromTracksForRequest(tracks, requested, subtitleLanguageSelection(opts))
+}
+
+func subtitleLanguagesFromTracks(tracks []client.SubtitleTrack, opts cli.Options) []string {
+	return client.SubtitleLanguagesFromTracks(tracks, subtitleLanguageSelection(opts))
+}
+
+func subtitleLanguageSelection(opts cli.Options) client.SubtitleLanguageSelection {
+	return client.SubtitleLanguageSelection{
+		IncludeManual: opts.WriteSubs || !opts.WriteAutoSubs,
+		IncludeAuto:   opts.WriteAutoSubs,
 	}
-	safeLang := strings.TrimSpace(strings.ToLower(lang))
-	if safeLang == "" {
-		safeLang = "unknown"
+}
+
+func subtitleOutputPath(outputTemplate string, info *client.VideoInfo, lang string, outputExt string, restrictFilenamesAndTrim ...any) string {
+	restrict, trimLimit := templatePathOptions(restrictFilenamesAndTrim...)
+	return client.SubtitleOutputPath(info, lang, outputExt, client.SidecarPathOptions{
+		OutputTemplate:    outputTemplate,
+		RestrictFilenames: restrict,
+		TrimFilenames:     trimLimit,
+	})
+}
+
+func templatePathOptions(values ...any) (bool, int) {
+	restrict := false
+	trimLimit := 0
+	if len(values) > 0 {
+		if v, ok := values[0].(bool); ok {
+			restrict = v
+		}
 	}
-	if strings.TrimSpace(outputTemplate) == "" {
-		return fmt.Sprintf("%s.%s.%s", info.ID, safeLang, outputExt)
+	if len(values) > 1 {
+		if v, ok := values[1].(int); ok {
+			trimLimit = v
+		}
 	}
-	base := strings.TrimSpace(outputTemplate)
-	base = strings.ReplaceAll(base, "%(id)s", sanitizeTemplateToken(info.ID))
-	base = strings.ReplaceAll(base, "%(title)s", sanitizeTemplateToken(info.Title))
-	base = strings.ReplaceAll(base, "%(uploader)s", sanitizeTemplateToken(info.Author))
-	base = strings.ReplaceAll(base, "%(ext)s", outputExt)
-	base = strings.ReplaceAll(base, "%(itag)s", "subs_"+safeLang)
-	if strings.TrimSpace(base) == "" {
-		return fmt.Sprintf("%s.%s.%s", info.ID, safeLang, outputExt)
+	return restrict, trimLimit
+}
+
+func trimOutputPathFilename(path string, limit int) string {
+	return client.TrimOutputPathFilename(path, limit)
+}
+
+func writeInfoJSONSidecar(input string, info *client.VideoInfo, opts cli.Options) error {
+	outputPath := infoJSONOutputPath(effectiveOutputTemplate(opts), info, opts.RestrictFilenames, opts.TrimFilenames)
+	if shouldSkipExistingOutput(outputPath, opts) {
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Skipping existing info JSON: %s\n", outputPath)
+		}
+		return nil
 	}
-	if ext := filepath.Ext(base); ext != "" {
-		base = strings.TrimSuffix(base, ext)
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil && filepath.Dir(outputPath) != "." {
+		return fmt.Errorf("failed to create info json directory: %w", err)
 	}
-	return base + "." + safeLang + "." + outputExt
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create info json: %w", err)
+	}
+	defer f.Close()
+
+	if err := emitDumpSingleJSON(f, input, info); err != nil {
+		return fmt.Errorf("failed to write info json: %w", err)
+	}
+	if shouldPrintHumanText(opts) {
+		fmt.Printf("Written info JSON: %s\n", outputPath)
+	}
+	return nil
+}
+
+func writePlaylistInfoJSONSidecar(playlist *client.PlaylistInfo, opts cli.Options) error {
+	info := playlistInfoAsVideoInfo(playlist)
+	outputPath := infoJSONOutputPath(effectiveOutputTemplate(opts), info, opts.RestrictFilenames, opts.TrimFilenames)
+	if shouldSkipExistingOutput(outputPath, opts) {
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Skipping existing playlist info JSON: %s\n", outputPath)
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil && filepath.Dir(outputPath) != "." {
+		return fmt.Errorf("failed to create playlist info json directory: %w", err)
+	}
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create playlist info json: %w", err)
+	}
+	defer f.Close()
+
+	if err := emitPlaylistInfoJSON(f, playlist); err != nil {
+		return fmt.Errorf("failed to write playlist info json: %w", err)
+	}
+	if shouldPrintHumanText(opts) {
+		fmt.Printf("Written playlist info JSON: %s\n", outputPath)
+	}
+	return nil
+}
+
+func playlistInfoAsVideoInfo(playlist *client.PlaylistInfo) *client.VideoInfo {
+	if playlist == nil {
+		return &client.VideoInfo{}
+	}
+	author := firstNonEmpty(playlist.Uploader, playlist.Channel)
+	return &client.VideoInfo{
+		ID:        playlist.ID,
+		Title:     playlist.Title,
+		Author:    author,
+		ChannelID: firstNonEmpty(playlist.ChannelID, playlist.UploaderID),
+	}
+}
+
+func infoJSONOutputPath(outputTemplate string, info *client.VideoInfo, restrictFilenamesAndTrim ...any) string {
+	restrict, trimLimit := templatePathOptions(restrictFilenamesAndTrim...)
+	return client.InfoJSONOutputPath(info, client.SidecarPathOptions{
+		OutputTemplate:    outputTemplate,
+		RestrictFilenames: restrict,
+		TrimFilenames:     trimLimit,
+	})
+}
+
+func writeDescriptionSidecar(info *client.VideoInfo, opts cli.Options) error {
+	outputPath := descriptionOutputPath(effectiveOutputTemplate(opts), info, opts.RestrictFilenames, opts.TrimFilenames)
+	if shouldSkipExistingOutput(outputPath, opts) {
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Skipping existing description: %s\n", outputPath)
+		}
+		return nil
+	}
+	if err := client.WriteDescriptionSidecar(info, outputPath); err != nil {
+		return err
+	}
+	if shouldPrintHumanText(opts) {
+		fmt.Printf("Written description: %s\n", outputPath)
+	}
+	return nil
+}
+
+type shortcutKind string
+
+const (
+	shortcutURL     shortcutKind = "url"
+	shortcutWebloc  shortcutKind = "webloc"
+	shortcutDesktop shortcutKind = "desktop"
+)
+
+func writeURLLinkSidecar(input string, info *client.VideoInfo, opts cli.Options) error {
+	return writeShortcutSidecar(input, info, opts, shortcutURL)
+}
+
+func writeShortcutSidecar(input string, info *client.VideoInfo, opts cli.Options, kind shortcutKind) error {
+	outputPath := shortcutOutputPath(effectiveOutputTemplate(opts), info, kind, opts.RestrictFilenames, opts.TrimFilenames)
+	if shouldSkipExistingOutput(outputPath, opts) {
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Skipping existing %s link: %s\n", kind, outputPath)
+		}
+		return nil
+	}
+	if err := client.WriteShortcutSidecar(input, info, client.ShortcutKind(kind), outputPath); err != nil {
+		return err
+	}
+	if shouldPrintHumanText(opts) {
+		fmt.Printf("Written %s link: %s\n", kind, outputPath)
+	}
+	return nil
+}
+
+func urlLinkOutputPath(outputTemplate string, info *client.VideoInfo, restrictFilenamesAndTrim ...any) string {
+	return shortcutOutputPath(outputTemplate, info, shortcutURL, restrictFilenamesAndTrim...)
+}
+
+func shortcutOutputPath(outputTemplate string, info *client.VideoInfo, kind shortcutKind, restrictFilenamesAndTrim ...any) string {
+	restrict, trimLimit := templatePathOptions(restrictFilenamesAndTrim...)
+	return client.ShortcutOutputPath(info, client.ShortcutKind(kind), client.SidecarPathOptions{
+		OutputTemplate:    outputTemplate,
+		RestrictFilenames: restrict,
+		TrimFilenames:     trimLimit,
+	})
+}
+
+func shortcutSidecarBody(input string, info *client.VideoInfo, kind shortcutKind) string {
+	return client.ShortcutSidecarBody(input, info, client.ShortcutKind(kind))
+}
+
+func descriptionOutputPath(outputTemplate string, info *client.VideoInfo, restrictFilenamesAndTrim ...any) string {
+	restrict, trimLimit := templatePathOptions(restrictFilenamesAndTrim...)
+	return client.DescriptionOutputPath(info, client.SidecarPathOptions{
+		OutputTemplate:    outputTemplate,
+		RestrictFilenames: restrict,
+		TrimFilenames:     trimLimit,
+	})
+}
+
+func writeThumbnailSidecar(ctx context.Context, c *client.Client, info *client.VideoInfo, opts cli.Options) error {
+	outputPath := thumbnailOutputPath(effectiveOutputTemplate(opts), info, opts.RestrictFilenames, opts.TrimFilenames)
+	if shouldSkipExistingOutput(outputPath, opts) {
+		if shouldPrintHumanText(opts) {
+			fmt.Printf("Skipping existing thumbnail: %s\n", outputPath)
+		}
+		return nil
+	}
+	if err := c.DownloadThumbnail(ctx, info, outputPath); err != nil {
+		return err
+	}
+	if shouldPrintHumanText(opts) {
+		fmt.Printf("Written thumbnail: %s\n", outputPath)
+	}
+	return nil
+}
+
+func thumbnailOutputPath(outputTemplate string, info *client.VideoInfo, restrictFilenamesAndTrim ...any) string {
+	restrict, trimLimit := templatePathOptions(restrictFilenamesAndTrim...)
+	return client.ThumbnailOutputPath(info, client.SidecarPathOptions{
+		OutputTemplate:    outputTemplate,
+		RestrictFilenames: restrict,
+		TrimFilenames:     trimLimit,
+	})
+}
+
+func thumbnailExt(rawURL string) string {
+	return client.ThumbnailExt(rawURL)
 }
 
 func sanitizeTemplateToken(v string) string {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return "unknown"
-	}
-	var b strings.Builder
-	for _, r := range v {
-		switch r {
-		case '<', '>', ':', '"', '/', '\\', '|', '?', '*':
-			b.WriteRune('_')
-		default:
-			if r < 32 {
-				b.WriteRune('_')
-				continue
-			}
-			b.WriteRune(r)
-		}
-	}
-	out := strings.TrimSpace(b.String())
-	if out == "" {
-		return "unknown"
-	}
-	return out
+	return client.SanitizeOutputTemplateToken(v)
 }
 
-func shouldSkipDownloadByArchive(input string) bool {
+func sanitizeRestrictedTemplateToken(v string) string {
+	return client.SanitizeRestrictedOutputTemplateToken(v)
+}
+
+func shouldSkipDownloadByArchive(input string, opts cli.Options) bool {
 	if activeDownloadArchive == nil {
 		return false
 	}
@@ -556,16 +1557,41 @@ func shouldSkipDownloadByArchive(input string) bool {
 	if !activeDownloadArchive.Has(videoID) {
 		return false
 	}
-	fmt.Printf("Skipping (in archive): %s\n", videoID)
+	if shouldPrintHumanText(opts) {
+		fmt.Printf("Skipping (in archive): %s\n", videoID)
+	}
 	return true
 }
 
 func recordCompletedDownload(videoID string) error {
 	if activeDownloadArchive == nil {
-		return nil
+		return incrementDownloadLimit()
 	}
 	if err := activeDownloadArchive.Add(videoID); err != nil {
 		return fmt.Errorf("failed to update download archive: %w", err)
+	}
+	return incrementDownloadLimit()
+}
+
+func recordForcedArchiveIfRequested(info *client.VideoInfo, opts cli.Options) error {
+	if !opts.ForceWriteArchive || info == nil {
+		return nil
+	}
+	return recordCompletedDownload(info.ID)
+}
+
+type downloadLimit struct {
+	Max   int
+	Count int
+}
+
+func incrementDownloadLimit() error {
+	if activeDownloadLimit == nil || activeDownloadLimit.Max <= 0 {
+		return nil
+	}
+	activeDownloadLimit.Count++
+	if activeDownloadLimit.Count >= activeDownloadLimit.Max {
+		return errMaxDownloadsReached
 	}
 	return nil
 }
@@ -864,30 +1890,10 @@ func inferDownloadRole(path string) string {
 	}
 }
 
-type ytdlpDumpSingleJSON struct {
-	ID           string             `json:"id"`
-	Title        string             `json:"title,omitempty"`
-	WebpageURL   string             `json:"webpage_url,omitempty"`
-	OriginalURL  string             `json:"original_url,omitempty"`
-	Extractor    string             `json:"extractor,omitempty"`
-	ExtractorKey string             `json:"extractor_key,omitempty"`
-	URL          string             `json:"url,omitempty"`
-	Ext          string             `json:"ext,omitempty"`
-	Formats      []ytdlpFormatEntry `json:"formats,omitempty"`
-}
-
-type ytdlpFormatEntry struct {
-	FormatID string `json:"format_id,omitempty"`
-	URL      string `json:"url,omitempty"`
-	Ext      string `json:"ext,omitempty"`
-	VCodec   string `json:"vcodec,omitempty"`
-	ACodec   string `json:"acodec,omitempty"`
-	Width    int    `json:"width,omitempty"`
-	Height   int    `json:"height,omitempty"`
-	FPS      int    `json:"fps,omitempty"`
-	TBR      int    `json:"tbr,omitempty"`
-	Protocol string `json:"protocol,omitempty"`
-}
+type ytdlpDumpSingleJSON = client.YTDLPDumpSingleJSON
+type ytdlpPlaylistInfoJSON = client.YTDLPPlaylistInfoJSON
+type ytdlpPlaylistItemEntry = client.YTDLPPlaylistItemEntry
+type ytdlpFormatEntry = client.YTDLPFormatEntry
 
 func emitDumpSingleJSON(w io.Writer, input string, info *client.VideoInfo) error {
 	payload := buildDumpSingleJSONPayload(input, info)
@@ -896,102 +1902,35 @@ func emitDumpSingleJSON(w io.Writer, input string, info *client.VideoInfo) error
 	return enc.Encode(payload)
 }
 
+func emitPlaylistInfoJSON(w io.Writer, playlist *client.PlaylistInfo) error {
+	payload := buildPlaylistInfoJSONPayload(playlist)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(payload)
+}
+
+func buildPlaylistInfoJSONPayload(playlist *client.PlaylistInfo) ytdlpPlaylistInfoJSON {
+	return client.BuildYTDLPPlaylistInfoJSON(playlist)
+}
+
 func buildDumpSingleJSONPayload(input string, info *client.VideoInfo) ytdlpDumpSingleJSON {
-	webURL := canonicalWatchURL(input, info.ID)
-	bestURL, bestExt := pickBestDirectFormatURL(info.Formats)
-	formats := make([]ytdlpFormatEntry, 0, len(info.Formats))
-	for _, f := range info.Formats {
-		if strings.TrimSpace(f.URL) == "" {
-			continue
-		}
-		formats = append(formats, ytdlpFormatEntry{
-			FormatID: strconv.Itoa(f.Itag),
-			URL:      f.URL,
-			Ext:      mimeExt(f.MimeType),
-			VCodec:   codecLabel(f.HasVideo),
-			ACodec:   codecLabel(f.HasAudio),
-			Width:    f.Width,
-			Height:   f.Height,
-			FPS:      f.FPS,
-			TBR:      f.Bitrate / 1000,
-			Protocol: f.Protocol,
-		})
-	}
-	return ytdlpDumpSingleJSON{
-		ID:           info.ID,
-		Title:        info.Title,
-		WebpageURL:   webURL,
-		OriginalURL:  strings.TrimSpace(input),
-		Extractor:    "youtube",
-		ExtractorKey: "Youtube",
-		URL:          bestURL,
-		Ext:          bestExt,
-		Formats:      formats,
-	}
+	return client.BuildYTDLPDumpSingleJSON(input, info)
 }
 
 func canonicalWatchURL(input string, videoID string) string {
-	id := strings.TrimSpace(videoID)
-	if id != "" {
-		return "https://www.youtube.com/watch?v=" + id
-	}
-	return strings.TrimSpace(input)
+	return client.CanonicalWatchURL(input, videoID)
 }
 
-func codecLabel(enabled bool) string {
-	if enabled {
-		return "unknown"
-	}
-	return "none"
+func canonicalPlaylistURL(playlistID string) string {
+	return client.CanonicalPlaylistURL(playlistID)
 }
 
 func pickBestDirectFormatURL(formats []client.FormatInfo) (string, string) {
-	bestIdx := -1
-	for i, f := range formats {
-		if strings.TrimSpace(f.URL) == "" {
-			continue
-		}
-		if bestIdx == -1 {
-			bestIdx = i
-			continue
-		}
-		if compareFormatQuality(f, formats[bestIdx]) > 0 {
-			bestIdx = i
-		}
-	}
-	if bestIdx < 0 {
-		return "", ""
-	}
-	best := formats[bestIdx]
-	return best.URL, mimeExt(best.MimeType)
+	return client.PickBestDirectFormatURL(formats)
 }
 
 func compareFormatQuality(a, b client.FormatInfo) int {
-	score := func(f client.FormatInfo) int64 {
-		var s int64
-		// Prefer muxed AV for direct playback fallback behavior.
-		if f.HasAudio && f.HasVideo {
-			s += 10_000_000_000
-		} else if f.HasVideo {
-			s += 5_000_000_000
-		} else if f.HasAudio {
-			s += 1_000_000_000
-		}
-		s += int64(f.Width*f.Height) * 1000
-		s += int64(f.FPS) * 100
-		s += int64(f.Bitrate)
-		return s
-	}
-	as := score(a)
-	bs := score(b)
-	switch {
-	case as > bs:
-		return 1
-	case as < bs:
-		return -1
-	default:
-		return 0
-	}
+	return client.CompareFormatQuality(a, b)
 }
 
 type cliErrorReport struct {
@@ -1048,90 +1987,6 @@ func classifyExitCode(err error) int {
 	}
 }
 
-type downloadArchive struct {
-	path string
-	file *os.File
-	mu   sync.Mutex
-	ids  map[string]struct{}
-}
-
-func newDownloadArchive(path string) (*downloadArchive, error) {
-	cleanPath := strings.TrimSpace(path)
-	if cleanPath == "" {
-		return nil, fmt.Errorf("archive path is empty")
-	}
-	if dir := filepath.Dir(cleanPath); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, err
-		}
-	}
-	f, err := os.OpenFile(cleanPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return nil, err
-	}
-
-	archive := &downloadArchive{
-		path: cleanPath,
-		file: f,
-		ids:  make(map[string]struct{}),
-	}
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		if _, err := client.ExtractVideoID(line); err != nil {
-			continue
-		}
-		archive.ids[line] = struct{}{}
-	}
-	if err := scanner.Err(); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	return archive, nil
-}
-
-func (a *downloadArchive) Close() error {
-	if a == nil || a.file == nil {
-		return nil
-	}
-	return a.file.Close()
-}
-
-func (a *downloadArchive) Has(videoID string) bool {
-	if a == nil {
-		return false
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	_, ok := a.ids[videoID]
-	return ok
-}
-
-func (a *downloadArchive) Add(videoID string) error {
-	if a == nil {
-		return nil
-	}
-	if _, err := client.ExtractVideoID(videoID); err != nil {
-		return fmt.Errorf("invalid video id for archive: %q", videoID)
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, exists := a.ids[videoID]; exists {
-		return nil
-	}
-	if _, err := a.file.WriteString(videoID + "\n"); err != nil {
-		return err
-	}
-	if err := a.file.Sync(); err != nil {
-		return err
-	}
-	a.ids[videoID] = struct{}{}
-	return nil
+func newDownloadArchive(path string) (*client.DownloadArchive, error) {
+	return client.OpenDownloadArchive(path)
 }

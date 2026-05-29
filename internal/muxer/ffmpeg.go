@@ -17,16 +17,22 @@ type Muxer interface {
 
 // FFmpegMuxer implements Muxer using the ffmpeg command line tool.
 type FFmpegMuxer struct {
-	Path string
+	Path      string
+	ExtraArgs []string
 }
 
 // NewFFmpegMuxer returns a new FFmpegMuxer.
 // If path is empty, it looks for "ffmpeg" in PATH.
 func NewFFmpegMuxer(path string) *FFmpegMuxer {
+	return NewFFmpegMuxerWithExtraArgs(path, nil)
+}
+
+// NewFFmpegMuxerWithExtraArgs returns a new FFmpegMuxer with additional args.
+func NewFFmpegMuxerWithExtraArgs(path string, extraArgs []string) *FFmpegMuxer {
 	if path == "" {
 		path = "ffmpeg"
 	}
-	return &FFmpegMuxer{Path: path}
+	return &FFmpegMuxer{Path: path, ExtraArgs: append([]string(nil), extraArgs...)}
 }
 
 // Available checks if ffmpeg is executable.
@@ -38,6 +44,23 @@ func (f *FFmpegMuxer) Available() bool {
 // Merge merges video and audio files into a single output file with metadata.
 // It deletes the input files upon successful merge.
 func (f *FFmpegMuxer) Merge(ctx context.Context, videoPath, audioPath, outputPath string, meta types.Metadata) error {
+	args := f.mergeArgs(videoPath, audioPath, outputPath, meta)
+	cmd := exec.CommandContext(ctx, f.Path, args...)
+	cmd.Stdout = nil // or pipe to logger
+	cmd.Stderr = nil // or pipe to logger
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg merge failed: %w", err)
+	}
+
+	// Clean up input files
+	_ = os.Remove(videoPath)
+	_ = os.Remove(audioPath)
+
+	return nil
+}
+
+func (f *FFmpegMuxer) mergeArgs(videoPath, audioPath, outputPath string, meta types.Metadata) []string {
 	// ffmpeg -i video.mp4 -i audio.m4a -c:v copy -c:a copy -metadata title=... -y output.mp4
 	args := []string{
 		"-i", videoPath,
@@ -62,19 +85,7 @@ func (f *FFmpegMuxer) Merge(ctx context.Context, videoPath, audioPath, outputPat
 		args = append(args, "-metadata", "comment="+meta.Description)
 	}
 
+	args = append(args, f.ExtraArgs...)
 	args = append(args, "-y", outputPath)
-
-	cmd := exec.CommandContext(ctx, f.Path, args...)
-	cmd.Stdout = nil // or pipe to logger
-	cmd.Stderr = nil // or pipe to logger
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("ffmpeg merge failed: %w", err)
-	}
-
-	// Clean up input files
-	_ = os.Remove(videoPath)
-	_ = os.Remove(audioPath)
-
-	return nil
+	return args
 }

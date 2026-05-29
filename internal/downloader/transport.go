@@ -13,23 +13,27 @@ import (
 
 // TransportConfig controls retry/backoff behavior for downloader HTTP requests.
 type TransportConfig struct {
-	MaxRetries               int
-	InitialBackoff           time.Duration
-	MaxBackoff               time.Duration
-	RetryStatusCodes         []int
-	MaxConcurrency           int
-	SkipUnavailableFragments bool
-	MaxSkippedFragments      int
+	MaxRetries                  int
+	InitialBackoff              time.Duration
+	MaxBackoff                  time.Duration
+	RetryStatusCodes            []int
+	MaxConcurrency              int
+	SkipUnavailableFragments    bool
+	MaxSkippedFragments         int
+	ThrottledRateBytesPerSecond int64
+	ThrottledRateMinDuration    time.Duration
 }
 
 type effectiveTransportConfig struct {
-	MaxRetries               int
-	InitialBackoff           time.Duration
-	MaxBackoff               time.Duration
-	RetryStatusCodes         []int
-	MaxConcurrency           int
-	SkipUnavailableFragments bool
-	MaxSkippedFragments      int
+	MaxRetries                  int
+	InitialBackoff              time.Duration
+	MaxBackoff                  time.Duration
+	RetryStatusCodes            []int
+	MaxConcurrency              int
+	SkipUnavailableFragments    bool
+	MaxSkippedFragments         int
+	ThrottledRateBytesPerSecond int64
+	ThrottledRateMinDuration    time.Duration
 }
 
 type downloadHTTPStatusError struct {
@@ -40,6 +44,8 @@ type downloadHTTPStatusError struct {
 func (e *downloadHTTPStatusError) Error() string {
 	return fmt.Sprintf("download failed: status=%d", e.StatusCode)
 }
+
+var errThrottledDownload = errors.New("download speed below throttled-rate threshold")
 
 func normalizeTransportConfig(cfg TransportConfig) effectiveTransportConfig {
 	maxRetries := cfg.MaxRetries
@@ -64,14 +70,24 @@ func normalizeTransportConfig(cfg TransportConfig) effectiveTransportConfig {
 			http.StatusGatewayTimeout,
 		}
 	}
+	throttledRate := cfg.ThrottledRateBytesPerSecond
+	if throttledRate < 0 {
+		throttledRate = 0
+	}
+	throttledDuration := cfg.ThrottledRateMinDuration
+	if throttledDuration <= 0 {
+		throttledDuration = 3 * time.Second
+	}
 	return effectiveTransportConfig{
-		MaxRetries:               maxRetries,
-		InitialBackoff:           initialBackoff,
-		MaxBackoff:               maxBackoff,
-		RetryStatusCodes:         statusCodes,
-		MaxConcurrency:           max(1, cfg.MaxConcurrency),
-		SkipUnavailableFragments: cfg.SkipUnavailableFragments,
-		MaxSkippedFragments:      cfg.MaxSkippedFragments,
+		MaxRetries:                  maxRetries,
+		InitialBackoff:              initialBackoff,
+		MaxBackoff:                  maxBackoff,
+		RetryStatusCodes:            statusCodes,
+		MaxConcurrency:              max(1, cfg.MaxConcurrency),
+		SkipUnavailableFragments:    cfg.SkipUnavailableFragments,
+		MaxSkippedFragments:         cfg.MaxSkippedFragments,
+		ThrottledRateBytesPerSecond: throttledRate,
+		ThrottledRateMinDuration:    throttledDuration,
 	}
 }
 
@@ -92,6 +108,9 @@ func isRetryableError(err error, cfg effectiveTransportConfig) bool {
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
+	}
+	if errors.Is(err, errThrottledDownload) {
+		return true
 	}
 	var statusErr *downloadHTTPStatusError
 	if errors.As(err, &statusErr) {
@@ -155,7 +174,7 @@ func doGETBytesWithRetry(
 						RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 					}
 				}
-				return io.ReadAll(resp.Body)
+				return readAllWithTransportConfig(ctx, resp.Body, effectiveCfg)
 			}()
 			if readErr == nil {
 				return body, nil
@@ -178,6 +197,67 @@ func doGETBytesWithRetry(
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("request failed with unknown retry error")
+}
+
+func readAllWithTransportConfig(ctx context.Context, r io.Reader, cfg effectiveTransportConfig) ([]byte, error) {
+	if cfg.ThrottledRateBytesPerSecond > 0 {
+		r = throttledRateReader(ctx, r, cfg.ThrottledRateBytesPerSecond, cfg.ThrottledRateMinDuration)
+	}
+	return io.ReadAll(r)
+}
+
+func throttledRateReader(ctx context.Context, src io.Reader, bytesPerSecond int64, minDuration time.Duration) io.Reader {
+	if bytesPerSecond <= 0 {
+		return src
+	}
+	if minDuration <= 0 {
+		minDuration = 3 * time.Second
+	}
+	return &throttleDetectReader{
+		ctx:            ctx,
+		src:            src,
+		bytesPerSecond: bytesPerSecond,
+		minDuration:    minDuration,
+		start:          time.Now(),
+	}
+}
+
+type throttleDetectReader struct {
+	ctx            context.Context
+	src            io.Reader
+	bytesPerSecond int64
+	minDuration    time.Duration
+	start          time.Time
+	read           int64
+	throttleStart  time.Time
+}
+
+func (r *throttleDetectReader) Read(p []byte) (int, error) {
+	n, err := r.src.Read(p)
+	if n > 0 {
+		r.read += int64(n)
+		elapsed := time.Since(r.start)
+		if elapsed > 0 {
+			speed := float64(r.read) / elapsed.Seconds()
+			if speed < float64(r.bytesPerSecond) {
+				if r.throttleStart.IsZero() {
+					r.throttleStart = time.Now()
+				} else if time.Since(r.throttleStart) >= r.minDuration {
+					return n, errThrottledDownload
+				}
+			} else {
+				r.throttleStart = time.Time{}
+			}
+		}
+	}
+	if err == nil {
+		select {
+		case <-r.ctx.Done():
+			return n, r.ctx.Err()
+		default:
+		}
+	}
+	return n, err
 }
 
 func parseRetryAfter(raw string) time.Duration {
