@@ -6,9 +6,10 @@ import "net/http"
 type VideoStreamingProtocol string
 
 const (
-	StreamingProtocolHTTPS VideoStreamingProtocol = "https"
-	StreamingProtocolDASH  VideoStreamingProtocol = "dash"
-	StreamingProtocolHLS   VideoStreamingProtocol = "hls"
+	StreamingProtocolUnknown VideoStreamingProtocol = "unknown"
+	StreamingProtocolHTTPS   VideoStreamingProtocol = "https"
+	StreamingProtocolDASH    VideoStreamingProtocol = "dash"
+	StreamingProtocolHLS     VideoStreamingProtocol = "hls"
 )
 
 // PoTokenPolicy defines the policy for Proof of Origin (PO) Tokens.
@@ -19,19 +20,33 @@ type PoTokenPolicy struct {
 	NotRequiredWithPlayerToken bool
 }
 
+// PoTokenFetchPolicy controls how strictly POT fetching is enforced.
+type PoTokenFetchPolicy string
+
+const (
+	PoTokenFetchPolicyRequired    PoTokenFetchPolicy = "required"
+	PoTokenFetchPolicyRecommended PoTokenFetchPolicy = "recommended"
+	PoTokenFetchPolicyNever       PoTokenFetchPolicy = "never"
+)
+
 type ClientProfile struct {
-	Name            string
-	Version         string
-	APIKey          string
-	UserAgent       string
-	ContextNameID   int
-	RequireJSPlayer bool
-	SupportsCookies bool
-	RequiresAuth    bool
-	Host            string
-	Headers         http.Header
-	Screen          string // e.g. "EMBED"
-	
+	// ID is the registry/client alias used for policy and diagnostics
+	// (e.g. "web_safari"), distinct from Innertube clientName ("WEB").
+	ID                        string
+	Name                      string
+	Version                   string
+	APIKey                    string
+	UserAgent                 string
+	ContextNameID             int
+	RequireJSPlayer           bool
+	SupportsCookies           bool
+	SupportsAdPlaybackContext bool
+	RequiresAuth              bool
+	Host                      string
+	Headers                   http.Header
+	Screen                    string // e.g. "EMBED"
+	PlayerParams              string
+
 	// PoTokenPolicy map keyed by protocol (https, dash, hls).
 	PoTokenPolicy map[VideoStreamingProtocol]PoTokenPolicy
 }

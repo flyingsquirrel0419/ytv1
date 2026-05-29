@@ -1,0 +1,127 @@
+package client
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+)
+
+// SubtitleSidecarOptions controls package-level subtitle sidecar writes.
+type SubtitleSidecarOptions struct {
+	Languages         []string
+	RequestAll        bool
+	IncludeManual     bool
+	IncludeAuto       bool
+	OutputFormat      SubtitleOutputFormat
+	OutputTemplate    string
+	RestrictFilenames bool
+	TrimFilenames     int
+	NoOverwrites      bool
+	BeforeEach        func(context.Context) error
+}
+
+// SubtitleSidecarOutcome describes one requested subtitle sidecar attempt.
+type SubtitleSidecarOutcome struct {
+	Language string
+	Path     string
+	Written  bool
+	Skipped  bool
+	Err      error
+}
+
+// SubtitleSidecarResult summarizes subtitle sidecar writes.
+type SubtitleSidecarResult struct {
+	Outcomes []SubtitleSidecarOutcome
+}
+
+// WrittenCount returns the number of subtitle files written.
+func (r SubtitleSidecarResult) WrittenCount() int {
+	n := 0
+	for _, outcome := range r.Outcomes {
+		if outcome.Written {
+			n++
+		}
+	}
+	return n
+}
+
+// FailureMessages returns formatted per-language failure messages.
+func (r SubtitleSidecarResult) FailureMessages() []string {
+	failures := make([]string, 0)
+	for _, outcome := range r.Outcomes {
+		if outcome.Err != nil {
+			failures = append(failures, fmt.Sprintf("%s(%v)", outcome.Language, outcome.Err))
+		}
+	}
+	return failures
+}
+
+// WriteRequestedSubtitleSidecars writes subtitle sidecars for the requested
+// language policy using package transcript and subtitle-track APIs.
+func (c *Client) WriteRequestedSubtitleSidecars(ctx context.Context, input string, info *VideoInfo, opts SubtitleSidecarOptions) (SubtitleSidecarResult, error) {
+	langs := append([]string(nil), opts.Languages...)
+	if opts.RequestAll || SubtitleLanguagesRequestAll(langs) {
+		tracks, err := c.GetSubtitleTracks(ctx, input)
+		if err != nil {
+			return SubtitleSidecarResult{}, err
+		}
+		langs = SubtitleLanguagesFromTracksForRequest(tracks, langs, SubtitleLanguageSelection{
+			IncludeManual: opts.IncludeManual,
+			IncludeAuto:   opts.IncludeAuto,
+		})
+	} else {
+		langs = ApplySubtitleLanguageExclusions(langs)
+	}
+	if len(langs) == 0 {
+		langs = []string{"en"}
+	}
+
+	result := SubtitleSidecarResult{Outcomes: make([]SubtitleSidecarOutcome, 0, len(langs))}
+	for _, lang := range langs {
+		if opts.BeforeEach != nil {
+			if err := opts.BeforeEach(ctx); err != nil {
+				return result, err
+			}
+		}
+		transcript, err := c.GetTranscript(ctx, input, lang)
+		if err != nil {
+			result.Outcomes = append(result.Outcomes, SubtitleSidecarOutcome{Language: lang, Err: err})
+			continue
+		}
+		outputPath := SubtitleOutputPath(info, transcript.LanguageCode, string(opts.OutputFormat), SidecarPathOptions{
+			OutputTemplate:    opts.OutputTemplate,
+			RestrictFilenames: opts.RestrictFilenames,
+			TrimFilenames:     opts.TrimFilenames,
+		})
+		outcome := SubtitleSidecarOutcome{Language: transcript.LanguageCode, Path: outputPath}
+		if opts.NoOverwrites && fileExists(outputPath) {
+			outcome.Skipped = true
+			result.Outcomes = append(result.Outcomes, outcome)
+			continue
+		}
+		if err := WriteTranscript(outputPath, transcript, opts.OutputFormat); err != nil {
+			outcome.Err = err
+			result.Outcomes = append(result.Outcomes, outcome)
+			continue
+		}
+		outcome.Written = true
+		result.Outcomes = append(result.Outcomes, outcome)
+	}
+
+	failures := result.FailureMessages()
+	if result.WrittenCount() == 0 && len(failures) > 0 {
+		return result, fmt.Errorf("failed to write subtitles: %s", strings.Join(failures, "; "))
+	}
+	return result, nil
+}
+
+func fileExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	if _, err := os.Stat(path); err == nil {
+		return true
+	}
+	return false
+}

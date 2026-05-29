@@ -11,11 +11,18 @@ type defaultRegistry struct {
 func NewRegistry() Registry {
 	return &defaultRegistry{
 		clients: map[string]ClientProfile{
-			"web":          WebClient,
-			"web_embedded": WebEmbeddedClient,
-			"android":      AndroidClient,
-			"ios":          iOSClient,
-			"tv":           TVClient,
+			"web":                 WebClient,
+			"web_safari":          WebSafariClient,
+			"web_creator":         WebCreatorClient,
+			"web_embedded":        WebEmbeddedClient,
+			"web_embedded_player": WebEmbeddedClient,
+			"mweb":                MWebClient,
+			"android":             AndroidClient,
+			"android_vr":          AndroidVRClient,
+			"ios":                 iOSClient,
+			"tv":                  TVClient,
+			"tvhtml5":             TVClient,
+			"tv_downgraded":       TVClient,
 		},
 	}
 }
@@ -24,13 +31,16 @@ func (r *defaultRegistry) Get(name string) (ClientProfile, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	c, ok := r.clients[name]
+	if ok {
+		c.ID = name
+	}
 	return c, ok
 }
 
 func (r *defaultRegistry) All() []ClientProfile {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	
+
 	all := make([]ClientProfile, 0, len(r.clients))
 	for _, c := range r.clients {
 		all = append(all, c)
